@@ -12,6 +12,7 @@
     "close": "关闭",
     "apply": "应用筛选",
     "clear": "清空所有筛选",
+    "save": "保存",
     "sponsor": "赞助者",
     "channel": "通道",
     "latency": "延迟",
@@ -41,12 +42,14 @@
     }
   },
   "header": {
-    "brand": "Sakrylle Status",
     "tagline": "Sakrylle API 服务可用性监测",
+    "contactBtn": "联系我们",
+    "contactBtnShort": "联系",
     "stats": {
       "healthy": "正常运行",
       "issues": "异常告警"
-    }
+    },
+    "brand": "Sakrylle Status"
   },
   "controls": {
     "filters": {
@@ -54,7 +57,9 @@
       "categoryLabel": "服务分类",
       "provider": "所有服务商",
       "service": "所有服务",
-      "channel": "所有通道"
+      "channel": "所有通道",
+      "vendor": "所有厂商",
+      "model": "所有模型"
     },
     "categories": {
       "charity": "公益站",
@@ -130,6 +135,10 @@
       "disabled": "自动刷新：已暂停",
       "enabledHint": "自动刷新中，点击暂停",
       "disabledHint": "已暂停，点击恢复"
+    },
+    "drawings": {
+      "show": "显示画作列",
+      "hide": "隐藏画作列"
     }
   },
   "favorites": {
@@ -142,17 +151,23 @@
     }
   },
   "table": {
+    "qualityHintLink": "中转站质量检测",
     "headers": {
       "annotation": "标注",
       "provider": "服务商",
       "sponsor": "赞助者",
       "service": "服务",
+      "serviceTooltip": "服务列标的是接入协议族——用哪套 API、哪个客户端连上去：CC 是 Anthropic Messages 协议（Claude Code），CX 是 OpenAI 协议（Codex CLI），GM 是 Gemini 协议。跑的是谁家的模型，看模型名前的厂商图标。",
       "channel": "通道",
       "model": "模型",
       "priceRatio": "价格",
       "priceRatioLine1": "价格",
       "priceRatioLine2": "¥/$",
       "priceRatioTooltip": "多少人民币可用 1 美元 token，仅作参考",
+      "quality": "质量",
+      "qualityTooltip": "由 <diag>diag.relaypulse.top</diag> 独立采样的质量分（0-100）。通道里每个模型一条 5 点 sparkline 叠绘：30d 均 / 7d 均 / 最近 3 次单 sample；80 / 100 两条参考线作 Y 轴刻度。",
+      "drawing": "画作",
+      "drawingTooltip": "rpdiag 最近 3 次出了分的测试里，模型画的「鹈鹕骑自行车」SVG。格子里是最新一幅（超过 7 天的会变淡），鼠标移上去看 3 幅，右下角小图是同一组官方模型的画。画风只作直观参考。",
       "listedDays": "收录天数",
       "listedDaysLine1": "收录",
       "listedDaysLine2": "天数",
@@ -168,7 +183,8 @@
       "lastCheck": "状态/延迟",
       "service": "服务类型",
       "priceRatio": "价格",
-      "listedDays": "收录"
+      "listedDays": "收录",
+      "quality": "质量"
     },
     "categoryLabels": {
       "promoted": "商业站",
@@ -180,14 +196,17 @@
     },
     "expandDetails": "查看详情",
     "collapseDetails": "收起详情",
+    "qualityPending": "待测",
+    "qualityPendingTooltip": "该通道已在监测，但 rpdiag 尚未对其发起质量采样——排到即测。",
     "heatmapHint": "点击色块查看详细信息（已聚合 {{from}} → {{to}} 个数据点）",
     "timeLabels": {
       "24h": "24h",
       "days": "{{count}}d"
     },
+    "modelVendorTooltip": "模型厂商：{{vendor}}（{{code}}）。指这条通道实际运行的模型出自哪家，与左侧「服务」列的接入协议是两回事。",
     "channelType": {
-      "official": "官方通道",
-      "officialDesc": "服务商声称使用官方正规渠道",
+      "official": "官方直连 / 官方转售",
+      "officialDesc": "服务商声称走厂商官方入口或官方转售（如云平台），并标记为既非逆向也非混合",
       "reverse": "逆向通道",
       "reverseDesc": "服务商标记为非原生支持、通过技术手段适配",
       "mixed": "混合通道",
@@ -199,9 +218,24 @@
       "channelType": "通道类型",
       "probeUrl": "探测地址",
       "template": "请求体模板",
-      "coldReason": "冷板原因"
+      "coldReason": "冷板原因",
+      "qualityHardFail": {
+        "label": "质量移板",
+        "text": "{{models}} 近3次评测均未取得可评分响应，已暂移备用板",
+        "textNoModels": "近3次评测均未取得可评分响应，已暂移备用板"
+      }
     },
-    "filterByProvider": "按此服务商筛选"
+    "filterByProvider": "按此服务商筛选",
+    "drawing": {
+      "tooltipNote": "单次画作仅供参考：官方模型自己也会画出不同风格。右下角小图为同组官方的画。",
+      "moreLink": "在 rpdiag 查看",
+      "latestAlt": "最近一次出了分的测试的画作（{{time}}）",
+      "staleAlt": "最近一次出了分的测试已超过 7 天（{{time}}），近期测试没有出分",
+      "candidateAlt": "该通道的画作（{{time}}）",
+      "officialAlt": "同组官方的画作",
+      "failed": "画图失败",
+      "none": "无画作"
+    }
   },
   "card": {
     "uptime": "可用率:"
@@ -221,7 +255,10 @@
     "invalid_request": "请求参数错误",
     "network_error": "连接失败",
     "response_timeout": "响应超时",
-    "content_mismatch": "内容校验失败"
+    "content_mismatch": "内容校验失败",
+    "redirect_blocked": "重定向被拦截",
+    "response_too_large": "响应体过大",
+    "concurrency_limited": "并发受限"
   },
   "tooltip": {
     "title": "数据详情",
@@ -234,7 +271,28 @@
     "httpCodeBreakdown": "错误码分布"
   },
   "footer": {
-    "githubAria": "GitHub"
+    "detectLink": "中转站检测",
+    "disclaimer": {
+      "title": "平台声明",
+      "dataReference": {
+        "title": "真实消耗探测",
+        "text": "基于真实 Token 消耗发起探测，数据受当时网络环境及服务商负载影响，真实还原 API 响应质量"
+      },
+      "neutralMaintenance": {
+        "title": "开源透明运营",
+        "text": "全站代码遵循 MIT 协议完全开源，支持私有化部署验证。赞助商享有置顶展示、专属标签和高频监测权益，但可用率等监测数据始终客观真实"
+      },
+      "monitoringScope": {
+        "title": "全栈协议校验",
+        "text": "涵盖 TCP 连通性、RTT 延迟及响应内容深度校验。有效识别连接正常但无法对话的「API 假活」状态"
+      },
+      "liability": {
+        "title": "免责声明",
+        "text": "监测数据仅供技术参考，不构成对任何第三方服务商信誉或资金安全的背书。用户与服务商的交互风险自负"
+      }
+    },
+    "issuesBtn": "问题反馈",
+    "openSourceLabel": "开源项目，欢迎贡献"
   },
   "provider": {
     "pageTitle": "{{name}} - 服务监测",
@@ -258,6 +316,12 @@
     "composite": "综合",
     "modelPrefix": "🔄"
   },
+  "share": {
+    "share": "分享",
+    "shareShort": "分享",
+    "linkCopied": "链接已复制到剪贴板",
+    "copyFailed": "复制失败，请手动复制链接"
+  },
   "externalLink": {
     "title": "即将离开 Sakrylle Status",
     "target": "目标网站",
@@ -275,14 +339,19 @@
     "switchTheme": "切换主题",
     "selectTheme": "选择主题",
     "defaultDark": "默认暗色",
+    "nightDark": "护眼暗色",
     "lightCool": "冷灰亮色",
+    "lightWarm": "暖灰亮色",
     "defaultDarkShort": "暗色",
-    "lightCoolShort": "冷亮"
+    "nightDarkShort": "护眼",
+    "lightCoolShort": "冷亮",
+    "lightWarmShort": "暖亮"
   },
   "community": {
     "title": "加入社群",
     "items": {
-      "qqGroup": "QQ 群"
+      "qqGroup": "QQ 群",
+      "telegramGroup": "Telegram 群"
     },
     "groupNumber": "群号",
     "joinLink": "点击加入",
@@ -294,6 +363,254 @@
     "close": "关闭",
     "discussions": "讨论",
     "moreAnnouncements": "还有 {{count}} 条公告"
+  },
+  "onboarding": {
+    "meta": {
+      "title": "申请收录",
+      "description": "提交您的 API 服务到 Sakrylle Status 监测平台"
+    },
+    "title": "申请收录",
+    "description": "提交您的 API 服务信息，通过连通性测试后即可申请收录",
+    "loading": "正在加载表单配置...",
+    "metaErrorHint": "该功能可能尚未启用，请联系管理员",
+    "steps": {
+      "provider": "服务商",
+      "connection": "连通性",
+      "confirm": "确认"
+    },
+    "next": "下一步",
+    "back": "上一步",
+    "providerInfo": {
+      "title": "服务商信息",
+      "agreementText": "我已阅读并同意",
+      "agreementLink": "收录协议",
+      "providerName": "服务商名称",
+      "providerNamePlaceholder": "例如：MyService",
+      "websiteUrl": "官网地址",
+      "category": "类别",
+      "categories": {
+        "commercial": "商业站",
+        "public": "公益站"
+      },
+      "serviceType": "服务类型",
+      "serviceTypes": {
+        "cc": "CC",
+        "cx": "CX",
+        "gm": "GM"
+      },
+      "identity": "您的身份",
+      "identities": {
+        "publicOwner": "公益站站长",
+        "publicOwnerDesc": "提交自己的公益站，用于测试或研究，免费接入",
+        "commercialOwner": "商业站站长",
+        "commercialOwnerDesc": "提交自己的商业站，通过平台推广获客",
+        "personal": "个人用户",
+        "personalDesc": "推荐优秀的中转站，通过 Aff 链接获取奖励"
+      },
+      "sponsorLevel": "赞助等级",
+      "sponsorLevels": {
+        "public": "公益链路",
+        "signal": "信号链路",
+        "pulse": "脉冲链路"
+      },
+      "channelType": "通道类型",
+      "channelTypes": {
+        "O": "官方通道",
+        "ODesc": "自建号池，直接对接官方上游（订阅 / 官方 API / 云平台），不含逆向或第三方兜底",
+        "R": "逆向通道",
+        "RDesc": "通过逆向 Web 会话、脚本等非官方方式接入上游",
+        "M": "混合通道",
+        "MDesc": "官方与逆向等多类上游并存，或含第三方兜底 / 备用池"
+      },
+      "channelSource": "通道来源",
+      "customSource": "自定义...",
+      "customSourcePlaceholder": "输入自定义来源",
+      "channelSourceCustomPlaceholder": "输入来源名称（大写字母/数字）",
+      "providerNameHint": "服务商展示名称，支持中文等任意语言（最长 100 字符）；若含非英文字符，用于网址的英文代号将由我们分配。",
+      "channelSourcePlaceholder": "请选择接入来源",
+      "channelSourceHint": "没有合适的来源？请联系运营补充（QQ:18058344）",
+      "channelName": "通道显示名称",
+      "channelNamePlaceholder": "例如：Max 高速线路",
+      "channelNameHint": "显示在状态页通道列，可用中文；留空则显示通道标识；最多 {{max}} 个字符",
+      "channelNameInvalid": "最多 {{max}} 个字符，且不能包含控制字符或零宽字符",
+      "channelGroup": "通道分组代号",
+      "channelGroupHint": "1-8 位小写字母或数字，仅用于生成通道标识（如 us、eu、v2），不作为展示名称；留空默认 main",
+      "sourceCategories": {
+        "subscription": "订阅账户",
+        "official": "官方 API",
+        "cloud": "云平台",
+        "reverse": "逆向",
+        "mixed": "混合"
+      },
+      "channelCodePreview": "通道标识预览",
+      "optional": "（可选）"
+    },
+    "connectionTest": {
+      "title": "连通性测试",
+      "description": "输入您的 API 接入信息并运行测试，测试通过后方可提交申请",
+      "baseUrl": "API 基础地址",
+      "baseUrlHint": "必须使用 HTTPS 协议",
+      "apiKey": "API Key",
+      "apiKeyPlaceholder": "输入 API Key",
+      "apiKeyHint": "仅用于验证与监测授权，将加密存储",
+      "showApiKey": "显示 API Key",
+      "hideApiKey": "隐藏 API Key",
+      "testType": "服务类型",
+      "runTest": "运行测试",
+      "rerunTest": "重新测试",
+      "testing": "测试中...",
+      "resultTitle": "测试结果",
+      "probeStatus": "探测状态",
+      "latency": "延迟",
+      "httpCode": "HTTP 状态码",
+      "subStatus": "细分状态",
+      "error": "错误信息",
+      "responseDetail": "响应详情",
+      "proofValid": "测试证明有效（剩余 {{time}}）",
+      "proofExpired": "测试证明已过期，请重新测试",
+      "model": "监测的模型",
+      "modelHint": "选择这条通道要被监测的模型；测试与上架用的是同一个",
+      "modelVendorUnknown": "不在列表 / 暂不确定",
+      "requestModel": "实际请求模型"
+    },
+    "test": {
+      "statusAvailable": "可用",
+      "statusDegraded": "波动",
+      "statusUnavailable": "不可用",
+      "statusUnknown": "未知"
+    },
+    "confirm": {
+      "title": "确认提交",
+      "description": "请确认以下信息无误后提交申请",
+      "sectionProvider": "服务商信息",
+      "sectionConnection": "接入信息",
+      "copy": "复制",
+      "submit": "提交申请",
+      "submitting": "提交中...",
+      "successTitle": "申请已提交！",
+      "successDescription": "我们会尽快审核您的申请",
+      "publicId": "申请编号",
+      "publicIdHint": "请保存此编号，联系管理员审核时需要提供",
+      "contactLabel": "联系审核",
+      "copyTemplateHint": "一键复制联系模板：",
+      "contactTemplate": "您好，我提交了一个收录申请（编号：{{id}}，服务商：{{provider}}），请审核。",
+      "newSubmission": "提交新申请",
+      "proofExpiredBanner": "测试证明已过期，请返回上一步重新测试",
+      "proofExpiringSoon": "测试证明即将过期，请尽快提交",
+      "agreement": {
+        "title": "入驻须知与确认",
+        "intro": "本平台 pulse 等级免费收录、商务等级为付费赞助，请逐条阅读并勾选，全部确认后方可提交：",
+        "clausePaid": "我已知悉 pulse（脉冲链路）等级免费收录；beacon 及以上商务等级为付费赞助（预付费按月计费，到期未续费自动降级为 pulse，已付费用不退还）。",
+        "clauseApiKey": "我同意平台将所提供的 API Key 用于配置验证、可用性监测与深度质量检测（含响应元数据、SSE 时序、缓存 token、模型字段与自报身份等解析，覆盖 diag.relaypulse.top）及相关展示；不同意则无法入驻。",
+        "clauseQuality": "我保证通道实际模型质量与所声明渠道一致（声明官方须确为官方 API）；如不一致，平台可加负向标签、下架或移入冷板。",
+        "clauseNoCheat": "我保证不以任何形式针对平台的可用性监测或质量检测探针作弊，包括伪造或缓存探针响应、回显探针预期答案、或在识别探针来源后向其返回与真实用户不同的响应等；一经查实，平台将立即强制下架该通道并公开通报。",
+        "clauseLegit": "我对所提供的接入端点、API Key、品牌与链接拥有合法使用权，且提交信息真实准确、运营合规。",
+        "clauseNoEndorse": "我理解赞助标识与置顶仅为展示与监测权益，不构成平台对其信誉、资金或服务质量的背书；平台保留因合规风险或投诉单方下架的权利。",
+        "fullText": "完整条款见",
+        "fullLink": "《入驻须知与确认》",
+        "allRequiredHint": "请勾选全部要点后再提交"
+      }
+    }
+  },
+  "contact": {
+    "meta": {
+      "title": "联系我们 | Sakrylle Status",
+      "description": "申请收录、变更通道配置或提交反馈"
+    },
+    "title": "联系我们",
+    "description": "选择您需要的服务，我们将为您提供帮助",
+    "apply": {
+      "title": "申请收录",
+      "description": "提交新的 API 服务到 Sakrylle Status 监测平台"
+    },
+    "change": {
+      "title": "申请变更",
+      "description": "修改已收录通道的配置信息（如地址、密钥等）"
+    },
+    "feedback": {
+      "title": "提交反馈",
+      "description": "建议、问题反馈或其他事务"
+    },
+    "community": {
+      "title": "加入社群",
+      "description": "加入 QQ 群，与其他用户交流"
+    },
+    "discussions": {
+      "title": "参与讨论",
+      "description": "在 GitHub Discussions 提问、分享和交流"
+    }
+  },
+  "changeRequest": {
+    "meta": {
+      "title": "申请变更 | Sakrylle Status",
+      "description": "修改已收录通道的配置信息"
+    },
+    "title": "申请变更",
+    "subtitle": "使用您的 API Key 验证身份，修改已收录通道的配置",
+    "steps": {
+      "auth": "身份验证",
+      "edit": "编辑信息",
+      "test": "连通测试",
+      "review": "确认提交"
+    },
+    "back": "返回",
+    "next": "下一步",
+    "auth": {
+      "title": "身份验证",
+      "description": "请输入您在本平台已收录通道的 API Key，系统将自动匹配对应的通道",
+      "placeholder": "输入 API Key",
+      "submit": "验证",
+      "invalidKey": "请输入有效的 API Key（至少 10 个字符）",
+      "authFailed": "API Key 验证失败"
+    },
+    "edit": {
+      "title": "编辑通道信息",
+      "description": "修改 {{channel}} 通道的配置信息，留空表示不修改",
+      "selectChannel": "选择通道",
+      "multipleChannels": "您的 API Key 匹配到多个通道，请选择需要变更的通道",
+      "current": "当前值",
+      "noChange": "不修改",
+      "newApiKeyPlaceholder": "如需更换 API Key，请在此输入新的",
+      "noChanges": "请至少修改一个字段",
+      "invalidDisplayName": "展示名称含不可见字符或过长，请检查后重填。"
+    },
+    "fields": {
+      "providerName": "服务商名称",
+      "providerUrl": "官网地址",
+      "channelName": "通道名称",
+      "category": "类别",
+      "sponsorLevel": "赞助等级",
+      "baseUrl": "API 基础地址",
+      "newApiKey": "新 API Key"
+    },
+    "test": {
+      "title": "连通性测试",
+      "description": "您修改了监测相关配置，需要通过连通性测试后才能提交",
+      "testType": "服务类型",
+      "variant": "请求模板",
+      "run": "运行测试",
+      "running": "测试中，请稍候...",
+      "passed": "测试通过",
+      "failed": "测试未通过",
+      "latency": "延迟",
+      "retry": "重新测试",
+      "requestFailed": "测试请求失败",
+      "proofExpired": "测试证明已过期，请返回重新测试"
+    },
+    "review": {
+      "title": "确认变更",
+      "description": "请确认以下变更信息无误后提交",
+      "target": "目标通道",
+      "submit": "提交变更",
+      "submitFailed": "提交失败",
+      "noCheatConfirm": "我已阅读并确认上述「禁止监测作弊」条款",
+      "noCheatRequired": "变更网址或密钥前，请先勾选确认「禁止监测作弊」条款"
+    },
+    "done": {
+      "title": "变更请求已提交",
+      "description": "您的变更请求已提交，请保存以下编号，联系管理员时需要提供",
+      "newRequest": "提交新的变更"
+    }
   },
   "admin": {
     "meta": {
@@ -342,6 +659,9 @@
       "monitors": "通道管理",
       "changes": "变更请求"
     },
+    "submissions": {
+      "searchPlaceholder": "按申请编号搜索（前 8 位或完整 UUID）"
+    },
     "monitors": {
       "backToList": "← 返回列表",
       "parentChannel": "父通道",
@@ -350,6 +670,8 @@
       "noChildren": "暂无子通道",
       "addChild": "添加子通道",
       "removeChild": "移除",
+      "childToggleBlockedByParent": "父通道已停用，子模型的开关在它恢复后才生效",
+      "removeChildWarning": "移除（会永久丢失该模型的监测历史，只是想临时停请用\"停用\"）",
       "enable": "启用",
       "disable": "停用",
       "show": "显示",
@@ -359,7 +681,10 @@
       "copyKey": "复制 API Key",
       "copiedKey": "已复制",
       "probe": "探测测试",
+      "probeResponseBody": "响应内容",
       "probing": "探测中...",
+      "probeTargetPending": "目标通道配置尚未生效，请保存并等待热更新后重试",
+      "viaProxy": "经代理",
       "templateDirtyHint": "修改模板需保存后再测试（base_url / api_key 可即时覆盖）",
       "tabs": {
         "detail": "详情",
@@ -391,7 +716,7 @@
       "confirmArchive": "确认归档？",
       "confirmYes": "确认",
       "create": "新建通道",
-      "searchPlaceholder": "搜索 provider / service / channel...",
+      "searchPlaceholder": "搜索服务商 / 通道 / 模型 / 域名，空格分隔多个词...",
       "allBoards": "全部板块",
       "allStatus": "全部状态",
       "statusActive": "活跃",
@@ -448,6 +773,8 @@
         "sponsorLevel": "赞助等级",
         "keyType": "Key 类型",
         "board": "板块",
+        "coldReason": "冷板原因",
+        "coldReasonPlaceholder": "例如：长期持续不可用（公开显示）",
         "interval": "间隔",
         "model": "模型",
         "apiKey": "API Key",
@@ -459,7 +786,8 @@
         "autoColdExempt": "豁免自动冷板",
         "autoColdExemptHint": "启用后清除并阻止系统自动将此通道移入冷板",
         "autoMoveExempt": "豁免自动移板",
-        "autoMoveExemptHint": "启用后跳过所有基于可用率的自动移板（不影响到期降级）"
+        "autoMoveExemptHint": "启用后跳过所有基于可用率的自动移板（不影响到期降级）",
+        "modelVendor": "模型厂商"
       },
       "form": {
         "title": "新建监测通道",
@@ -468,7 +796,8 @@
         "attributes": "业务属性",
         "childChannels": "子通道（多模型）",
         "childHint": "如需监测同一通道的多个模型，可在此添加子通道。子通道继承父通道的 PSC 和配置。",
-        "modelPlaceholder": "留空则使用模板默认值",
+        "modelPlaceholder": "留空则跟随模板（改动会断历史）",
+        "modelKeyWarning": "注意：「模型」是该行历史序列的业务键，不是发给上游的模型 ID。留空则跟随模板；填写或修改它会断开这一行已有的历史数据。",
         "requiredFields": "Provider、Service、Channel 为必填",
         "create": "创建"
       }
@@ -493,7 +822,31 @@
       "delete": "删除",
       "confirmDelete": "确认删除此变更请求？",
       "proposedChanges": "拟变更内容",
+      "adminEdit": "管理员修改",
+      "readOnly": "只读",
       "currentSnapshot": "当前快照",
+      "liveUnavailable": {
+        "manual": "该通道为人工模式，对照提交时快照",
+        "deleted": "通道已不存在，对照提交时快照",
+        "error": "读取当前配置失败，对照提交时快照"
+      },
+      "editElsewhereHint": "如需调整其它通道字段，请到「通道管理」",
+      "colField": "字段",
+      "colCurrent": "当前",
+      "colProposed": "改为",
+      "fields": {
+        "provider_name": "服务商名称",
+        "provider_url": "官网地址",
+        "website_url": "官网地址",
+        "channel_name": "通道名称",
+        "category": "类别",
+        "sponsor_level": "赞助等级",
+        "listed_since": "收录日期",
+        "expires_at": "到期日期",
+        "price_min": "最低价",
+        "price_max": "最高价",
+        "base_url": "API 基础地址"
+      },
       "testInfo": "测试信息",
       "testType": "服务类型",
       "testVariant": "请求模板",
@@ -504,7 +857,10 @@
       "adminNote": "审核备注",
       "adminNotePlaceholder": "输入审核备注...",
       "rejectNotePlaceholder": "输入驳回原因...",
-      "confirmReject": "确认驳回"
+      "confirmReject": "确认驳回",
+      "antiCheatNA": "禁止监测作弊条款：不适用（未改监测相关字段）",
+      "antiCheatConfirmed": "禁止监测作弊条款：已确认",
+      "antiCheatMissing": "禁止监测作弊条款：未确认"
     },
     "detail": {
       "back": "返回列表",
@@ -526,7 +882,17 @@
       "sponsorLevel": "赞助等级",
       "channelType": "通道类型",
       "channelSource": "通道来源",
+      "channelGroup": "通道分组代号",
       "channelName": "通道显示名称",
+      "expiresAt": "到期日期",
+      "targetProvider": "Provider 覆盖",
+      "targetProviderHint": "英文代号，留空则由服务商名称派生",
+      "targetService": "Service 覆盖",
+      "targetServiceHint": "英文代号，留空使用派生值",
+      "targetChannel": "Channel 覆盖",
+      "targetChannelHint": "英文代号，留空使用派生值",
+      "suggestedChannel": "建议",
+      "pscOverrideInvalid": "这里填的是英文网址代号、不是显示名称：只能用小写字母、数字、短横线，不能以短横线开头或结尾，也不能出现连续短横线，长度不超过 100 个字符",
       "listedSince": "收录日期",
       "priceMin": "最低倍率",
       "priceMax": "最高倍率",
@@ -548,13 +914,46 @@
       "testing": "测试中...",
       "testResult": "测试结果",
       "subStatus": "细分状态",
+      "testCurl": "请求 curl 命令",
+      "testCurlCopy": "复制",
+      "testCurlCopyWithKey": "复制（含密钥）",
+      "testCurlKeyHint": "默认用 $RP_API_KEY 占位真实密钥，可安全分享；点「复制（含密钥）」会注入真实密钥生成可直接运行的命令。",
       "publish": "上架",
       "reject": "驳回",
       "rejectNotePlaceholder": "输入驳回原因...",
       "confirmReject": "确认驳回",
       "delete": "删除",
       "confirmDelete": "确认删除",
-      "cancel": "取消"
+      "cancel": "取消",
+      "model": "行级模型 ID",
+      "modelVendor": "模型厂商"
     }
+  },
+  "vendors": {
+    "anthropic": "Anthropic",
+    "openai": "OpenAI",
+    "google": "Google",
+    "bytedance": "字节跳动",
+    "zhipu": "智谱",
+    "moonshot": "月之暗面",
+    "minimax": "MiniMax",
+    "deepseek": "DeepSeek",
+    "qwen": "通义千问",
+    "grok": "Grok",
+    "agnes": "Agnes"
+  },
+  "modelFamilies": {
+    "opus": "Opus",
+    "sonnet": "Sonnet",
+    "haiku": "Haiku",
+    "fable": "Fable",
+    "gpt": "GPT",
+    "gemini": "Gemini",
+    "deepseek": "DeepSeek",
+    "doubao": "豆包",
+    "glm": "GLM",
+    "kimi": "Kimi",
+    "minimax": "MiniMax",
+    "other": "其他"
   }
 }

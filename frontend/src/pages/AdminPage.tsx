@@ -1,16 +1,17 @@
 import { useState } from 'react';
 import { Helmet } from 'react-helmet-async';
 import { useTranslation } from 'react-i18next';
-import { useAdmin } from '../features/admin/hooks/useAdmin';
-import { useMonitorAdmin } from '../features/admin/hooks/useMonitorAdmin';
-import { useChangeAdmin } from '../features/admin/hooks/useChangeAdmin';
-import { AdminAuth } from '../features/admin/components/AdminAuth';
-import { SubmissionList } from '../features/admin/components/SubmissionList';
-import { SubmissionDetail } from '../features/admin/components/SubmissionDetail';
-import { MonitorList } from '../features/admin/components/MonitorList';
-import { MonitorDetail } from '../features/admin/components/MonitorDetail';
-import { MonitorForm } from '../features/admin/components/MonitorForm';
-import { ChangeRequestList } from '../features/admin/components/ChangeRequestList';
+import { Loader2 } from 'lucide-react';
+import { useAdmin } from '../hooks/useAdmin';
+import { useMonitorAdmin } from '../hooks/useMonitorAdmin';
+import { useChangeAdmin } from '../hooks/useChangeAdmin';
+import { AdminAuth } from '../components/admin/AdminAuth';
+import { SubmissionList } from '../components/admin/SubmissionList';
+import { SubmissionDetail } from '../components/admin/SubmissionDetail';
+import { MonitorList } from '../components/admin/MonitorList';
+import { MonitorDetail } from '../components/admin/MonitorDetail';
+import { MonitorForm } from '../components/admin/MonitorForm';
+import { ChangeRequestList } from '../components/admin/ChangeRequestList';
 
 type AdminTab = 'submissions' | 'monitors' | 'changes';
 
@@ -22,9 +23,10 @@ export default function AdminPage() {
   const {
     token, isAuthenticated, setToken, logout,
     submissions, total, statusFilter, setStatusFilter,
-    page, setPage, isLoading,
+    page, setPage, isLoading, searchQuery, setSearchQuery,
     selectedSubmission, selectedApiKey, showApiKey, setShowApiKey,
     fetchDetail, fetchTemplates, updateSubmission, testSubmission, rejectSubmission, deleteSubmission, publishSubmission,
+    detailLoadingId, cancelDetail,
     setSelectedSubmission,
     error: submissionError,
     suggestedChannel,
@@ -34,6 +36,8 @@ export default function AdminPage() {
   const changeAdmin = useChangeAdmin(token);
 
   const handleTabChange = (tab: AdminTab) => {
+    cancelDetail();
+    monitor.cancelDetail();
     setActiveTab(tab);
     setShowCreateForm(false);
     monitor.setSelectedMonitor(null);
@@ -45,7 +49,7 @@ export default function AdminPage() {
   return (
     <>
       <Helmet>
-        <title>{t('admin.meta.title')} | Sakrylle Status</title>
+        <title>{`${t('admin.meta.title')} | Sakrylle Status`}</title>
         <meta name="robots" content="noindex,nofollow" />
       </Helmet>
 
@@ -98,7 +102,9 @@ export default function AdminPage() {
 
               {/* 申请管理 Tab */}
               {activeTab === 'submissions' && (
-                selectedSubmission ? (
+                detailLoadingId && !selectedSubmission ? (
+                  <DetailLoading />
+                ) : selectedSubmission ? (
                   <SubmissionDetail
                     submission={selectedSubmission}
                     apiKey={selectedApiKey}
@@ -111,7 +117,7 @@ export default function AdminPage() {
                     onDelete={() => deleteSubmission(selectedSubmission.public_id)}
                     onPublish={(board) => publishSubmission(selectedSubmission.public_id, board)}
                     suggestedChannel={suggestedChannel}
-                    onBack={() => setSelectedSubmission(null)}
+                    onBack={() => { cancelDetail(); setSelectedSubmission(null); }}
                   />
                 ) : (
                   <SubmissionList
@@ -121,6 +127,8 @@ export default function AdminPage() {
                     setStatusFilter={setStatusFilter}
                     page={page}
                     setPage={setPage}
+                    searchQuery={searchQuery}
+                    setSearchQuery={setSearchQuery}
                     onSelect={(sub) => fetchDetail(sub.public_id)}
                     isLoading={isLoading}
                   />
@@ -138,12 +146,15 @@ export default function AdminPage() {
                     }}
                     onCancel={() => setShowCreateForm(false)}
                   />
+                ) : monitor.detailLoadingId && !monitor.selectedMonitor ? (
+                  <DetailLoading />
                 ) : monitor.selectedMonitor && monitor.selectedKey ? (
                   <MonitorDetail
                     fetchTemplates={monitor.fetchTemplates}
                     monitorFile={monitor.selectedMonitor}
                     monitorKey={monitor.selectedKey}
                     onBack={() => {
+                      monitor.cancelDetail();
                       monitor.setSelectedMonitor(null);
                       monitor.setSelectedKey(null);
                     }}
@@ -155,21 +166,22 @@ export default function AdminPage() {
                         monitor.deleteMonitor(monitor.selectedKey);
                       }
                     }}
-                    onToggle={(field, value) => {
+                    onToggle={(req) => {
                       if (monitor.selectedKey) {
-                        monitor.toggleMonitor(monitor.selectedKey, field, value);
+                        monitor.toggleMonitor(monitor.selectedKey, req);
                       }
                     }}
-                    onProbe={async (overrides) => {
+                    onProbe={async (overrides, targetModel) => {
                       if (monitor.selectedKey) {
-                        return monitor.probeMonitor(monitor.selectedKey, overrides);
+                        return monitor.probeMonitor(monitor.selectedKey, overrides, targetModel);
                       }
                       return null;
                     }}
                     fetchLogs={monitor.fetchMonitorLogs}
-                    isProbing={monitor.isProbing}
-                    probeResult={monitor.probeResult}
-                    probeError={monitor.probeError}
+                    probeTargets={monitor.probeTargets}
+                    probingTargets={monitor.probingTargets}
+                    probeResults={monitor.probeResults}
+                    probeErrors={monitor.probeErrors}
                   />
                 ) : (
                   <div className="space-y-4">
@@ -192,7 +204,7 @@ export default function AdminPage() {
                       searchQuery={monitor.searchQuery}
                       setSearchQuery={monitor.setSearchQuery}
                       onSelect={(key) => monitor.fetchDetail(key)}
-                      onRefresh={monitor.fetchList}
+                      onRefresh={monitor.refreshList}
                     />
                   </div>
                 )
@@ -204,12 +216,12 @@ export default function AdminPage() {
                   isLoading={changeAdmin.isLoading}
                   statusFilter={changeAdmin.statusFilter}
                   setStatusFilter={changeAdmin.setStatusFilter}
-                  onSelect={(id) => changeAdmin.fetchDetail(id)}
                   onUpdate={(id, updates) => changeAdmin.updateChange(id, updates)}
                   onApprove={(id) => changeAdmin.approveChange(id)}
                   onReject={(id, note) => changeAdmin.rejectChange(id, note)}
                   onApply={(id) => changeAdmin.applyChange(id)}
                   onDelete={(id) => changeAdmin.deleteChange(id)}
+                  pendingActions={changeAdmin.pendingActions}
                   error={changeAdmin.error}
                   featureDisabled={changeAdmin.featureDisabled}
                 />
@@ -219,6 +231,16 @@ export default function AdminPage() {
         </div>
       </main>
     </>
+  );
+}
+
+function DetailLoading() {
+  const { t } = useTranslation();
+  return (
+    <div className="flex items-center justify-center py-16 text-muted">
+      <Loader2 size={20} className="animate-spin mr-2" />
+      {t('admin.table.loading')}
+    </div>
   );
 }
 

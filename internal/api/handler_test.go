@@ -497,6 +497,41 @@ func TestStatusCacheClear(t *testing.T) {
 	}
 }
 
+// 缓存被未过期条目填满后，新 key 仍要能写入（淘汰最早到期的一条），
+// 否则请求方用随机参数填满缓存即可让合法请求永远直达数据库。
+func TestStatusCacheEvictsOldestWhenFull(t *testing.T) {
+	cache := newStatusCache(10*time.Second, 3)
+
+	cache.setWithTTL("oldest", []byte("a"), 5*time.Second)
+	cache.setWithTTL("k2", []byte("b"), 10*time.Second)
+	cache.setWithTTL("k3", []byte("c"), 10*time.Second)
+
+	cache.set("fresh", []byte("d"))
+
+	if data, ok := cache.get("fresh"); !ok || string(data) != "d" {
+		t.Fatalf("new key must be cached when full, got ok=%v data=%q", ok, data)
+	}
+	if _, ok := cache.get("oldest"); ok {
+		t.Error("entry with earliest expiry should have been evicted")
+	}
+	for _, k := range []string{"k2", "k3"} {
+		if _, ok := cache.get(k); !ok {
+			t.Errorf("entry %q should survive eviction", k)
+		}
+	}
+	if n := len(cache.entries); n != 3 {
+		t.Errorf("cache size: want 3, got %d", n)
+	}
+}
+
+func TestStatusCacheZeroSizeDisablesCaching(t *testing.T) {
+	cache := newStatusCache(10*time.Second, 0)
+	cache.set("k", []byte("v"))
+	if _, ok := cache.get("k"); ok {
+		t.Error("cache with maxSize 0 must not store entries")
+	}
+}
+
 // --- incrementStatusCount ---
 
 func TestIncrementStatusCount(t *testing.T) {
@@ -574,7 +609,7 @@ func TestApplyBoardOverrides_PSCPropagation(t *testing.T) {
 		{Provider: "other", Service: "cc", Channel: "free", Board: "hot"},
 	}
 
-	result := h.applyBoardOverrides(monitors)
+	result := h.applyBoardOverrides(monitors, nil, 0)
 
 	// root 被降级
 	if result[0].Board != "secondary" {
@@ -628,13 +663,44 @@ func TestApplyBoardOverrides_ColdReasonPropagation(t *testing.T) {
 		{Provider: "acme", Service: "cc", Channel: "vip", Model: "gpt-4o", Parent: "acme/cc/vip", Board: "hot"},
 	}
 
-	result := h.applyBoardOverrides(monitors)
+	result := h.applyBoardOverrides(monitors, nil, 0)
 
 	if result[0].Board != "cold" || result[0].ColdReason == "" {
 		t.Fatalf("root: board=%s cold_reason=%q", result[0].Board, result[0].ColdReason)
 	}
 	if result[1].Board != "cold" || result[1].ColdReason != result[0].ColdReason {
 		t.Fatalf("child: board=%s cold_reason=%q (expected same as root)", result[1].Board, result[1].ColdReason)
+	}
+}
+
+// TestApplyBoardOverrides_BoardReasonPropagation 测试质量移板机器码与触发模型名传播到 root 和子模型
+func TestApplyBoardOverrides_BoardReasonPropagation(t *testing.T) {
+	svc := automove.NewService(nil, &config.AppConfig{})
+	svc.SetOverrides(map[storage.MonitorKey]automove.MonitorOverride{
+		{Provider: "acme", Service: "cc", Channel: "vip", Model: ""}: {
+			Board:                "secondary",
+			BoardReason:          "quality_hardfail",
+			QualityTriggerModels: "claude-opus",
+		},
+	})
+
+	h := &Handler{
+		config:    &config.AppConfig{},
+		autoMover: svc,
+	}
+
+	monitors := []config.ServiceConfig{
+		{Provider: "acme", Service: "cc", Channel: "vip", Board: "hot"},
+		{Provider: "acme", Service: "cc", Channel: "vip", Model: "gpt-4o", Parent: "acme/cc/vip", Board: "hot"},
+	}
+
+	result := h.applyBoardOverrides(monitors, nil, 0)
+
+	if result[0].Board != "secondary" || result[0].BoardReason != "quality_hardfail" || result[0].BoardReasonModels != "claude-opus" {
+		t.Fatalf("root: board=%s board_reason=%q board_reason_models=%q", result[0].Board, result[0].BoardReason, result[0].BoardReasonModels)
+	}
+	if result[1].BoardReason != "quality_hardfail" || result[1].BoardReasonModels != "claude-opus" {
+		t.Fatalf("child: board_reason=%q board_reason_models=%q (expected same as root)", result[1].BoardReason, result[1].BoardReasonModels)
 	}
 }
 
@@ -654,7 +720,7 @@ func TestApplyBoardOverrides_ClearsColdReasonOnNonCold(t *testing.T) {
 		{Provider: "acme", Service: "cc", Channel: "vip", Board: "cold", ColdReason: "历史原因"},
 	}
 
-	result := h.applyBoardOverrides(monitors)
+	result := h.applyBoardOverrides(monitors, nil, 0)
 	if result[0].Board != "secondary" {
 		t.Fatalf("board=%s, want secondary", result[0].Board)
 	}
@@ -682,7 +748,7 @@ func TestApplyBoardOverrides_RootWithModel(t *testing.T) {
 		{Provider: "acme", Service: "cc", Channel: "vip", Model: "special", Board: "hot"},
 	}
 
-	result := h.applyBoardOverrides(monitors)
+	result := h.applyBoardOverrides(monitors, nil, 0)
 
 	if result[0].Board != "secondary" {
 		t.Errorf("root without model: want secondary, got %s", result[0].Board)
@@ -707,7 +773,7 @@ func TestApplyBoardOverrides_NoOverrides(t *testing.T) {
 		{Provider: "acme", Service: "cc", Channel: "vip", Board: "hot"},
 	}
 
-	result := h.applyBoardOverrides(monitors)
+	result := h.applyBoardOverrides(monitors, nil, 0)
 
 	// 无 override 时应返回原始 slice（不拷贝）
 	if &result[0] != &monitors[0] {
@@ -725,7 +791,7 @@ func TestApplyBoardOverrides_NilAutoMover(t *testing.T) {
 		{Provider: "acme", Service: "cc", Channel: "vip", Board: "hot"},
 	}
 
-	result := h.applyBoardOverrides(monitors)
+	result := h.applyBoardOverrides(monitors, nil, 0)
 	if &result[0] != &monitors[0] {
 		t.Errorf("should return original slice when autoMover is nil")
 	}

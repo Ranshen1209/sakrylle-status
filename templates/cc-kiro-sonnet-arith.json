@@ -1,6 +1,8 @@
 {
+	"self_serve_label": "Claude Sonnet 4.6（Kiro 逆向线路）",
 	"model": "Sonnet",
 	"request_model": "claude-sonnet-4-6",
+	"model_vendor": "anthropic",
 	"url": "{{BASE_URL}}/v1/messages",
 	"method": "POST",
 	"headers": {
@@ -14,7 +16,7 @@
 		"stream": false,
 		"messages": [{
 			"role": "user",
-			"content": "What is the output of this Python code?\n\nprint({{ARITH_A}} + {{ARITH_B}})\n\nReply ONLY: {{EXPECTED_ANSWER}}"
+			"content": "{{PROMPT}}"
 		}]
 	},
 	"response": {

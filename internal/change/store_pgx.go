@@ -3,6 +3,7 @@ package change
 import (
 	"context"
 	"fmt"
+	"time"
 
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
@@ -56,7 +57,16 @@ func (s *PgxStore) InitTable(ctx context.Context) error {
 		locale            TEXT,
 
 		created_at        BIGINT NOT NULL,
-		updated_at        BIGINT NOT NULL
+		updated_at        BIGINT NOT NULL,
+
+		agreement_accepted    BOOLEAN NOT NULL DEFAULT FALSE,
+		agreement_accepted_at BIGINT,
+		agreement_version     TEXT
+	);
+
+	CREATE TABLE IF NOT EXISTS change_used_test_jobs (
+		job_id TEXT PRIMARY KEY,
+		used_at BIGINT NOT NULL
 	);
 
 	CREATE INDEX IF NOT EXISTS idx_change_status ON change_requests(status, created_at DESC);
@@ -65,7 +75,39 @@ func (s *PgxStore) InitTable(ctx context.Context) error {
 	if _, err := s.pool.Exec(ctx, schema); err != nil {
 		return err
 	}
-	return s.ensureColumns(ctx)
+	if err := s.ensureColumns(ctx); err != nil {
+		return err
+	}
+	return s.backfillUsedTestJobs(ctx)
+}
+
+// backfillUsedTestJobs 把历史变更请求用过的 test_job_id 标记为已消费。理由见 SQLStore 同名方法。
+func (s *PgxStore) backfillUsedTestJobs(ctx context.Context) error {
+	_, err := s.pool.Exec(ctx, `
+		INSERT INTO change_used_test_jobs(job_id, used_at)
+		SELECT test_job_id, MAX(created_at)
+		FROM change_requests
+		WHERE test_job_id IS NOT NULL AND test_job_id <> ''
+		GROUP BY test_job_id
+		ON CONFLICT (job_id) DO NOTHING
+	`)
+	if err != nil {
+		return fmt.Errorf("回填已消费 test_job_id 失败: %w", err)
+	}
+	return nil
+}
+
+// ConsumeTestJobID 原子占用测试任务 ID；已被占用时返回 false。
+func (s *PgxStore) ConsumeTestJobID(ctx context.Context, jobID string) (bool, error) {
+	tag, err := s.pool.Exec(ctx, `
+		INSERT INTO change_used_test_jobs(job_id, used_at)
+		VALUES ($1, $2)
+		ON CONFLICT (job_id) DO NOTHING
+	`, jobID, time.Now().Unix())
+	if err != nil {
+		return false, fmt.Errorf("消费 test_job_id 失败: %w", err)
+	}
+	return tag.RowsAffected() == 1, nil
 }
 
 const pgxChangeAllColumns = `id, public_id, status,
@@ -76,7 +118,8 @@ const pgxChangeAllColumns = `id, public_id, status,
 	requires_test, test_type, test_variant, test_job_id, test_passed_at, test_latency_ms, test_http_code,
 	admin_note, reviewed_at, applied_at,
 	submitter_ip_hash, locale,
-	created_at, updated_at`
+	created_at, updated_at,
+	agreement_accepted, agreement_accepted_at, agreement_version`
 
 // Save 保存新变更请求
 func (s *PgxStore) Save(ctx context.Context, r *ChangeRequest) error {
@@ -90,8 +133,9 @@ func (s *PgxStore) Save(ctx context.Context, r *ChangeRequest) error {
 		requires_test, test_type, test_variant, test_job_id, test_passed_at, test_latency_ms, test_http_code,
 		admin_note, reviewed_at, applied_at,
 		submitter_ip_hash, locale,
-		created_at, updated_at
-	) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,$24,$25,$26,$27,$28)
+		created_at, updated_at,
+		agreement_accepted, agreement_accepted_at, agreement_version
+	) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,$24,$25,$26,$27,$28,$29,$30,$31)
 	RETURNING id`
 
 	err := s.pool.QueryRow(ctx, query,
@@ -104,6 +148,7 @@ func (s *PgxStore) Save(ctx context.Context, r *ChangeRequest) error {
 		pgxNullStr(r.AdminNote), r.ReviewedAt, r.AppliedAt,
 		pgxNullStr(r.SubmitterIPHash), pgxNullStr(r.Locale),
 		r.CreatedAt, r.UpdatedAt,
+		r.AgreementAccepted, r.AgreementAcceptedAt, pgxNullStr(r.AgreementVersion),
 	).Scan(&r.ID)
 	if err != nil {
 		return fmt.Errorf("保存变更请求失败: %w", err)
@@ -214,6 +259,8 @@ func pgxScanChangeRequest(row pgx.Row) (*ChangeRequest, error) {
 	var adminNote *string
 	var reviewedAt, appliedAt *int64
 	var ipHash, locale *string
+	var agreementAcceptedAt *int64
+	var agreementVersion *string
 
 	err := row.Scan(
 		&cr.ID, &cr.PublicID, &cr.Status,
@@ -225,6 +272,7 @@ func pgxScanChangeRequest(row pgx.Row) (*ChangeRequest, error) {
 		&adminNote, &reviewedAt, &appliedAt,
 		&ipHash, &locale,
 		&cr.CreatedAt, &cr.UpdatedAt,
+		&cr.AgreementAccepted, &agreementAcceptedAt, &agreementVersion,
 	)
 	if err != nil {
 		return nil, err
@@ -268,6 +316,10 @@ func pgxScanChangeRequest(row pgx.Row) (*ChangeRequest, error) {
 	if locale != nil {
 		cr.Locale = *locale
 	}
+	cr.AgreementAcceptedAt = agreementAcceptedAt
+	if agreementVersion != nil {
+		cr.AgreementVersion = *agreementVersion
+	}
 
 	return &cr, nil
 }
@@ -284,7 +336,7 @@ func (s *PgxStore) scanOne(ctx context.Context, query string, args ...any) (*Cha
 	return cr, nil
 }
 
-// ensureColumns 补全 test_type/test_variant 列（在线迁移）
+// ensureColumns 补全 test_type/test_variant/agreement_* 等新增列（在线迁移，幂等）
 func (s *PgxStore) ensureColumns(ctx context.Context) error {
 	rows, err := s.pool.Query(ctx, `
 		SELECT column_name
@@ -315,6 +367,9 @@ func (s *PgxStore) ensureColumns(ctx context.Context) error {
 	}{
 		{name: "test_type", ddl: `ALTER TABLE change_requests ADD COLUMN test_type TEXT`},
 		{name: "test_variant", ddl: `ALTER TABLE change_requests ADD COLUMN test_variant TEXT`},
+		{name: "agreement_accepted", ddl: `ALTER TABLE change_requests ADD COLUMN agreement_accepted BOOLEAN NOT NULL DEFAULT FALSE`},
+		{name: "agreement_accepted_at", ddl: `ALTER TABLE change_requests ADD COLUMN agreement_accepted_at BIGINT`},
+		{name: "agreement_version", ddl: `ALTER TABLE change_requests ADD COLUMN agreement_version TEXT`},
 	} {
 		if existing[col.name] {
 			continue

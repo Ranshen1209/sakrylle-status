@@ -55,7 +55,16 @@ func (s *SQLStore) InitTable(ctx context.Context) error {
 		locale            TEXT,
 
 		created_at        INTEGER NOT NULL,
-		updated_at        INTEGER NOT NULL
+		updated_at        INTEGER NOT NULL,
+
+		agreement_accepted    BOOLEAN NOT NULL DEFAULT FALSE,
+		agreement_accepted_at INTEGER,
+		agreement_version     TEXT
+	);
+
+	CREATE TABLE IF NOT EXISTS change_used_test_jobs (
+		job_id TEXT PRIMARY KEY,
+		used_at INTEGER NOT NULL
 	);
 
 	CREATE INDEX IF NOT EXISTS idx_change_status ON change_requests(status, created_at DESC);
@@ -64,7 +73,44 @@ func (s *SQLStore) InitTable(ctx context.Context) error {
 	if _, err := s.db.ExecContext(ctx, schema); err != nil {
 		return err
 	}
-	return s.ensureColumns(ctx)
+	if err := s.ensureColumns(ctx); err != nil {
+		return err
+	}
+	return s.backfillUsedTestJobs(ctx)
+}
+
+// backfillUsedTestJobs 把历史变更请求用过的 test_job_id 标记为已消费。
+//
+// 理由同 onboarding：升级瞬间不该白送仍在 TTL 内的历史 proof 一次重放。
+// 只有 requiresTest 的请求才会落 test_job_id（见 Submit），故非空即代表确已消费过。
+func (s *SQLStore) backfillUsedTestJobs(ctx context.Context) error {
+	_, err := s.db.ExecContext(ctx, `
+		INSERT OR IGNORE INTO change_used_test_jobs(job_id, used_at)
+		SELECT test_job_id, MAX(created_at)
+		FROM change_requests
+		WHERE test_job_id IS NOT NULL AND test_job_id <> ''
+		GROUP BY test_job_id
+	`)
+	if err != nil {
+		return fmt.Errorf("回填已消费 test_job_id 失败: %w", err)
+	}
+	return nil
+}
+
+// ConsumeTestJobID 原子占用测试任务 ID；已被占用时返回 false。
+func (s *SQLStore) ConsumeTestJobID(ctx context.Context, jobID string) (bool, error) {
+	result, err := s.db.ExecContext(ctx,
+		`INSERT OR IGNORE INTO change_used_test_jobs(job_id, used_at) VALUES (?, ?)`,
+		jobID, time.Now().Unix(),
+	)
+	if err != nil {
+		return false, fmt.Errorf("消费 test_job_id 失败: %w", err)
+	}
+	affected, err := result.RowsAffected()
+	if err != nil {
+		return false, fmt.Errorf("读取 test_job_id 消费结果失败: %w", err)
+	}
+	return affected == 1, nil
 }
 
 const changeAllColumns = `id, public_id, status,
@@ -75,7 +121,8 @@ const changeAllColumns = `id, public_id, status,
 	requires_test, test_type, test_variant, test_job_id, test_passed_at, test_latency_ms, test_http_code,
 	admin_note, reviewed_at, applied_at,
 	submitter_ip_hash, locale,
-	created_at, updated_at`
+	created_at, updated_at,
+	agreement_accepted, agreement_accepted_at, agreement_version`
 
 // Save 保存新变更请求
 func (s *SQLStore) Save(ctx context.Context, r *ChangeRequest) error {
@@ -89,8 +136,9 @@ func (s *SQLStore) Save(ctx context.Context, r *ChangeRequest) error {
 		requires_test, test_type, test_variant, test_job_id, test_passed_at, test_latency_ms, test_http_code,
 		admin_note, reviewed_at, applied_at,
 		submitter_ip_hash, locale,
-		created_at, updated_at
-	) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+		created_at, updated_at,
+		agreement_accepted, agreement_accepted_at, agreement_version
+	) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
 
 	result, err := s.db.ExecContext(ctx, query,
 		r.PublicID, r.Status,
@@ -102,6 +150,7 @@ func (s *SQLStore) Save(ctx context.Context, r *ChangeRequest) error {
 		nullStr(r.AdminNote), r.ReviewedAt, r.AppliedAt,
 		nullStr(r.SubmitterIPHash), nullStr(r.Locale),
 		r.CreatedAt, r.UpdatedAt,
+		r.AgreementAccepted, r.AgreementAcceptedAt, nullStr(r.AgreementVersion),
 	)
 	if err != nil {
 		return fmt.Errorf("保存变更请求失败: %w", err)
@@ -221,6 +270,8 @@ func scanChangeRequest(s scanner) (*ChangeRequest, error) {
 	var adminNote sql.NullString
 	var reviewedAt, appliedAt sql.NullInt64
 	var ipHash, locale sql.NullString
+	var agreementAcceptedAt sql.NullInt64
+	var agreementVersion sql.NullString
 
 	err := s.Scan(
 		&cr.ID, &cr.PublicID, &cr.Status,
@@ -232,6 +283,7 @@ func scanChangeRequest(s scanner) (*ChangeRequest, error) {
 		&adminNote, &reviewedAt, &appliedAt,
 		&ipHash, &locale,
 		&cr.CreatedAt, &cr.UpdatedAt,
+		&cr.AgreementAccepted, &agreementAcceptedAt, &agreementVersion,
 	)
 	if err != nil {
 		return nil, err
@@ -263,6 +315,11 @@ func scanChangeRequest(s scanner) (*ChangeRequest, error) {
 	}
 	cr.SubmitterIPHash = ipHash.String
 	cr.Locale = locale.String
+	if agreementAcceptedAt.Valid {
+		v := agreementAcceptedAt.Int64
+		cr.AgreementAcceptedAt = &v
+	}
+	cr.AgreementVersion = agreementVersion.String
 
 	return &cr, nil
 }
@@ -279,7 +336,7 @@ func (s *SQLStore) scanOne(ctx context.Context, query string, args ...any) (*Cha
 	return cr, nil
 }
 
-// ensureColumns 补全 test_type/test_variant 列（在线迁移）
+// ensureColumns 补全 test_type/test_variant/agreement_* 等新增列（在线迁移，幂等）
 func (s *SQLStore) ensureColumns(ctx context.Context) error {
 	rows, err := s.db.QueryContext(ctx, `PRAGMA table_info(change_requests)`)
 	if err != nil {
@@ -307,6 +364,9 @@ func (s *SQLStore) ensureColumns(ctx context.Context) error {
 	}{
 		{name: "test_type", ddl: `ALTER TABLE change_requests ADD COLUMN test_type TEXT`},
 		{name: "test_variant", ddl: `ALTER TABLE change_requests ADD COLUMN test_variant TEXT`},
+		{name: "agreement_accepted", ddl: `ALTER TABLE change_requests ADD COLUMN agreement_accepted BOOLEAN NOT NULL DEFAULT FALSE`},
+		{name: "agreement_accepted_at", ddl: `ALTER TABLE change_requests ADD COLUMN agreement_accepted_at INTEGER`},
+		{name: "agreement_version", ddl: `ALTER TABLE change_requests ADD COLUMN agreement_version TEXT`},
 	} {
 		if existing[col.name] {
 			continue

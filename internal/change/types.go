@@ -62,9 +62,20 @@ type ChangeRequest struct {
 	SubmitterIPHash string `json:"submitter_ip_hash,omitempty"`
 	Locale          string `json:"locale,omitempty"`
 
+	// 反作弊 re-attestation（仅在变更触及 base_url/API Key 时由后端盖戳；历史行为空）
+	AgreementAccepted   bool   `json:"agreement_accepted"`
+	AgreementAcceptedAt *int64 `json:"agreement_accepted_at,omitempty"`
+	AgreementVersion    string `json:"agreement_version,omitempty"`
+
 	// 时间戳
 	CreatedAt int64 `json:"created_at"`
 	UpdatedAt int64 `json:"updated_at"`
+
+	// === 以下为 API 响应 transient 字段：不入库，由 AdminList/AdminGetDetail 实时从 MonitorStore 填充 ===
+	// LiveCurrent 仅含 proposed_changes 涉及字段的通道「真实当前值」（取代提交时 current_snapshot）。
+	// 通道为 manual / 已删除 / 读失败时为空，前端回退展示 current_snapshot。
+	LiveCurrent       map[string]string `json:"live_current,omitempty"`
+	LiveCurrentSource string            `json:"live_current_source,omitempty"` // auto | manual | deleted | error
 }
 
 // AuthCandidate 认证后返回的通道候选
@@ -98,6 +109,10 @@ type AuthCandidate struct {
 // Store 变更请求持久化接口
 type Store interface {
 	Save(ctx context.Context, r *ChangeRequest) error
+
+	// ConsumeTestJobID 原子占用一个测试任务 ID，使同一次探测的 proof 只能兑换一次提交。
+	// 返回 true 表示本次抢占成功；false 表示该 ID 此前已被消费（proof 重放）。
+	ConsumeTestJobID(ctx context.Context, jobID string) (bool, error)
 	GetByPublicID(ctx context.Context, publicID string) (*ChangeRequest, error)
 	List(ctx context.Context, status string, limit, offset int) ([]*ChangeRequest, int, error)
 	Update(ctx context.Context, r *ChangeRequest) error

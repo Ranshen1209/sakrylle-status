@@ -21,6 +21,10 @@ type MonitorFileMetadata struct {
 	Revision  int64  `yaml:"revision" json:"revision"`
 	CreatedAt string `yaml:"created_at,omitempty" json:"created_at,omitempty"`
 	UpdatedAt string `yaml:"updated_at,omitempty" json:"updated_at,omitempty"`
+
+	// ChannelID 通道稳定唯一 id（ch_<uuidv4>），系统生成、不可变、跨产品 join 锚。
+	// 空表示历史文件待回填（cmd/backfillids 或 admin 创建时补）。
+	ChannelID string `yaml:"channel_id,omitempty" json:"channel_id,omitempty"`
 }
 
 // MonitorFile 是 monitors.d/ 中单个文件的结构。
@@ -100,6 +104,17 @@ func loadMonitorsDir(configDir string) ([]ServiceConfig, []MonitorFile, error) {
 		if prev, exists := seenKeys[key]; exists {
 			errs = append(errs, fmt.Errorf("%s: 与 %s 重复定义同一 PSC %s", name, prev, key))
 			continue
+		}
+
+		// channel_id 若非空须格式合法（手工 YAML 误填则加载失败，fail-closed）
+		if cid := file.Metadata.ChannelID; cid != "" && !IsValidChannelID(cid) {
+			errs = append(errs, fmt.Errorf("%s: channel_id 格式非法 %q（应为 ch_<uuidv4>）", name, cid))
+			continue
+		}
+
+		// 文件级 channel_id 下沉到每个监测行（运行时字段），供 /api/status 经 MonitorResult 暴露
+		for i := range file.Monitors {
+			file.Monitors[i].ChannelID = file.Metadata.ChannelID
 		}
 
 		file.Path = fullPath

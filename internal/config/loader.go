@@ -6,6 +6,7 @@ import (
 	"path/filepath"
 	"sort"
 	"strings"
+	"sync"
 
 	"gopkg.in/yaml.v3"
 
@@ -14,6 +15,12 @@ import (
 
 // Loader 配置加载器
 type Loader struct {
+	// currentMu 保护 currentConfig。
+	//
+	// 必须加锁：配置监听器的**事件 goroutine** 会经 getCurrent() 读它（判断某次文件事件
+	// 是否命中拒绝名单文件），而 reload 跑在 time.AfterFunc 的**另一个 goroutine** 里写它。
+	// 二者并发访问同一指针字段，无锁即数据竞争。
+	currentMu     sync.RWMutex
 	currentConfig *AppConfig
 }
 
@@ -35,6 +42,11 @@ func (l *Loader) Load(filename string) (*AppConfig, error) {
 	if err := yaml.Unmarshal(data, &cfg); err != nil {
 		return nil, fmt.Errorf("解析配置文件失败: %w", err)
 	}
+
+	// 记录 config.yaml 内联监测行数量：mergeExternalMonitorSources 只把 monitors.d 追加到
+	// 切片尾部，此后 validate/继承/normalize 均原地修改、不增删不重排，故 [0,inlineMonitorCount)
+	// 恒为内联行——供末尾按此边界只给内联行补 model_id。
+	inlineMonitorCount := len(cfg.Monitors)
 
 	absPath, err := filepath.Abs(filename)
 	if err != nil {
@@ -66,13 +78,40 @@ func (l *Loader) Load(filename string) (*AppConfig, error) {
 		return nil, fmt.Errorf("配置规范化失败: %w", err)
 	}
 
+	// 加载「已公开泄露 API Key」拒绝名单。名单是运行时配置的一部分，读取或内容错误一律
+	// fail-closed 让整次加载失败：启动期拒绝启动、热更新期由 loadOrRollback 保留上一份
+	// 完整配置（含上一份名单）。放在 normalize 之后，保证读到的是最终生效的 change_requests 段。
+	if err := cfg.loadRevokedKeyFile(configDir); err != nil {
+		return nil, fmt.Errorf("加载变更流程泄露 Key 拒绝名单失败: %w", err)
+	}
+
+	// 给未显式写 model_id 的 config.yaml 内联监测行补齐确定性派生 id（仅内存，不改写文件）。
+	// 官方 config.yaml.example 不含 model_id，若不补则被 CheckRuntimeModelIDs 运行时闸挡下、
+	// 容器启动即崩——这是新手按 QUICKSTART 部署的必经路径。放在 normalize 之后，
+	// 确保模板解析完成、按最终 PSCM 字段派生（model 可能来自模板；缺 model 时派生仍确定、
+	// 唯一性由后置 validateModelIDs 兜底）。monitors.d 语义完全不动
+	// （其缺 id 仍由运行时闸 fail-closed 提示走 backfillids，因它有写时补 id + 持久化流程）。
+	for i := 0; i < inlineMonitorCount; i++ {
+		if cfg.Monitors[i].ModelID == "" {
+			cfg.Monitors[i].ModelID = deriveInlineModelID(cfg.Monitors[i])
+		}
+	}
+
+	// validate() 早于派生执行、跳过了当时为空的 model_id；此处对派生结果重跑格式+全局唯一性
+	// 校验，兜住派生 id 与既有 id（内联或 monitors.d、含手工填的 v5）的冲突。O(n) 扫描、无锁。
+	if err := cfg.validateModelIDs(); err != nil {
+		return nil, fmt.Errorf("内联 model_id 派生后校验失败: %w", err)
+	}
+
 	// Phase 1: 最终态校验仅告警，不阻断启动或热更新
 	// 捕获 env 覆盖、模板注入、继承和 Normalize 之后可能遗留的不一致配置
 	for _, warn := range cfg.validateFinal() {
 		logger.Warn("config", "最终配置校验告警", "detail", warn.Error())
 	}
 
+	l.currentMu.Lock()
 	l.currentConfig = &cfg
+	l.currentMu.Unlock()
 	return &cfg, nil
 }
 
@@ -147,15 +186,18 @@ func (l *Loader) loadOrRollback(filename string) (*AppConfig, error) {
 	newConfig, err := l.Load(filename)
 	if err != nil {
 		// 返回错误但保持旧配置
-		if l.currentConfig != nil {
-			return l.currentConfig, fmt.Errorf("配置加载失败，保持旧配置: %w", err)
+		if current := l.getCurrent(); current != nil {
+			return current, fmt.Errorf("配置加载失败，保持旧配置: %w", err)
 		}
 		return nil, err
 	}
 	return newConfig, nil
 }
 
-// getCurrent 获取当前配置（仅包内使用）
+// getCurrent 获取当前配置（仅包内使用）。
+// 返回的是指针：AppConfig 加载完成后按约定只读，调用方不得改动。
 func (l *Loader) getCurrent() *AppConfig {
+	l.currentMu.RLock()
+	defer l.currentMu.RUnlock()
 	return l.currentConfig
 }

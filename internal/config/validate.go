@@ -7,6 +7,7 @@ import (
 	"time"
 
 	"monitor/internal/logger"
+	"monitor/internal/modelvendor"
 )
 
 // validateContext 承载 Validate() 过程中的中间数据
@@ -37,6 +38,11 @@ func (c *AppConfig) validate() error {
 		return fmt.Errorf("至少需要配置一个监测项")
 	}
 
+	// 信任边界先于一切业务校验：写错就 fail-closed，绝不让服务带着错误的客户端 IP 信任面起来
+	if err := ValidateTrustedProxies(c.Server.TrustedProxies); err != nil {
+		return err
+	}
+
 	// 0. 预处理：子项的 provider/service/channel 从 parent 路径继承
 	if err := c.preprocessParentInheritance(); err != nil {
 		return err
@@ -44,6 +50,12 @@ func (c *AppConfig) validate() error {
 
 	// 1. 监测项字段校验（不依赖最终 model，model 可能来自 template）
 	if err := c.validateMonitorFields(); err != nil {
+		return err
+	}
+
+	// model_id 是 YAML 字面字段，不来自 template、不参与继承，故可在模板解析前 fail-fast
+	// 校验格式与全局唯一（四元组唯一性因依赖 template 的 model 仍在 resolveTemplates 后校验）。
+	if err := c.validateModelIDs(); err != nil {
 		return err
 	}
 
@@ -80,8 +92,41 @@ func (c *AppConfig) validateResolvedModelConstraints() error {
 	if err := c.validateNoCycles(ctx); err != nil {
 		return err
 	}
+	// vendor 与 model 同属「可能来自 monitor 行、也可能来自 template」的字段，故与四元组唯一性
+	// 一样必须等模板解析完才校验得全——放在 validate() 里则模板声明的 vendor 永远不过校验。
+	if err := c.validateModelVendors(); err != nil {
+		return err
+	}
 
 	c.warnMultipleParentLayers()
+	return nil
+}
+
+// validateModelVendors 宽松校验模型厂商，并把合法值写回规范形式。
+//
+// 非空值必须是受控词表内的 code（见 internal/modelvendor）；空值放行。
+//
+// 只做逐行校验，不做跨行一致性：vendor 是行级属性，同一通道（PSC 三元组）的各层可以
+// 属于不同厂商——火山方舟这类聚合平台一个入口同时卖 DeepSeek / GLM / 豆包…，按厂商拆
+// 成多条通道只会让同一个入口在面板上占十几行。前端在每个模型名前单独出厂商图标。
+//
+// ⚠️ 与 model_id 不同，vendor **没有** fail-closed 运行时闸，将来也别加：它无法像
+// model_id 那样由 loader 自动派生（禁止从 request_model 前缀反推厂商——模型 ID 命名不稳、
+// 中转商可改写、同模型多别名，必然产生跨产品 join 漂移），加闸只会让自己手写内联监测行的
+// 自托管用户升级即 crash-loop（v2.69.2 修的正是 CheckRuntimeModelIDs 造成的同类伤害）。
+// 我方生产的覆盖靠「内置模板全部声明 vendor」保证，守卫见
+// TestBundledTemplatesDeclareModelVendor；native 模板那条唯一的例外由 validateFinal 告警兜。
+func (c *AppConfig) validateModelVendors() error {
+	for i := range c.Monitors {
+		m := &c.Monitors[i]
+
+		code, err := modelvendor.Normalize(m.ModelVendor)
+		if err != nil {
+			return fmt.Errorf("monitor[%d] %s: %w", i, modelIDLocation(*m), err)
+		}
+		// 写回规范形式，使下游（/api/status wire、跨产品 join）只需处理规范值。
+		m.ModelVendor = code
+	}
 	return nil
 }
 
@@ -138,6 +183,18 @@ func (c *AppConfig) validateFinal() []error {
 			resolvedRequestModel == "" {
 			warns = append(warns, fmt.Errorf("monitor[%d] %s/%s/%s: 引用了 {{MODEL}}/{{REQUEST_MODEL}}，但最终 request_model 与 model 均为空",
 				i, m.Provider, m.Service, m.Channel))
+		}
+
+		// native 模板厂商无关（见 IsNativeProbeTemplate），vendor 只能由监测行填写，没有模板兜底。
+		// 只告警不阻断：本仓库对 vendor 刻意不设 fail-closed 运行时闸（理由见
+		// TestBundledTemplatesDeclareModelVendor），且漏填的后果是前端厂商图标缺失——
+		// 是缺信息，不是错信息。
+		// 必须挂在 validateFinal 而非 validateModelVendors：后者跟在 resolveTemplates 里执行，
+		// 早于父子继承（normalize 第 7 步），没写 template 的子行那时还没拿到父行的 native 模板名，
+		// 判不出它是 native 行。native 子行不继承 vendor（见 inheritCoreBehavior），漏填在这里必现。
+		if IsNativeProbeTemplate(m.Template) && strings.TrimSpace(m.ModelVendor) == "" {
+			warns = append(warns, fmt.Errorf("monitor[%d] %s/%s/%s: 使用第一方厂商通用模板 %q 却未填 model_vendor，模型前将不显示厂商图标",
+				i, m.Provider, m.Service, m.Channel, m.Template))
 		}
 
 		// URL 安全告警：默认不允许探测目标直接指向私有网络 IP
@@ -247,6 +304,27 @@ func (c *AppConfig) validateMonitorUniqueness(ctx *validateContext) error {
 			return fmt.Errorf("重复的监测项: %s", key)
 		}
 		ctx.quadrupleKeySet[key] = struct{}{}
+	}
+	return nil
+}
+
+// validateMonitorDisplayKeyUniqueness 检查一组展示名 (provider 展示名/service/channel 展示名)
+// 只对应一条通道 (provider slug + channel slug)。为什么要唯一见 display_name.go。
+//
+// 须在 trim 与父子继承之后调用（normalize 末尾）。2026-10 CodeKey 两条 O-Max
+// （slug o-max / o-max-main）即此形状，曾拖垮约 80% 的 Claude 采样批次。
+func (c *AppConfig) validateMonitorDisplayKeyUniqueness() error {
+	seen := make(map[displayKey]displayOwner, len(c.Monitors))
+	for i, m := range c.Monitors {
+		key, cur := displayIdentity(m, fmt.Sprintf("monitor[%d] %s/%s/%s", i, m.Provider, m.Service, m.Channel))
+		prev, exists := seen[key]
+		if !exists {
+			seen[key] = cur
+			continue
+		}
+		if err := key.conflict(prev, cur); err != nil {
+			return err
+		}
 	}
 	return nil
 }
@@ -493,6 +571,38 @@ func (c *AppConfig) validateMonitorFields() error {
 				return fmt.Errorf("monitor[%d]: %w", i, err)
 			}
 		}
+	}
+	return nil
+}
+
+// CheckRuntimeModelIDs 运行时硬校验：所有监测行必须有非空 model_id。
+// 与 validateModelIDs（只校验格式/唯一、允许空，回填前兼容）分开——
+// Phase 1 起内部历史按 model_id 重键，展示读已切 model_id，缺 id 即该通道历史不可见，必须 fail-closed。
+// 故意不放进 validate()：present 是「已部署/已回填」运行时不变量，非配置语法不变量；
+// 放 validate() 会误伤大量用 model_id-less fixture 的 config 单测。
+func CheckRuntimeModelIDs(monitors []ServiceConfig) error {
+	for i, m := range monitors {
+		if strings.TrimSpace(m.ModelID) == "" {
+			return fmt.Errorf("monitor[%d] %s: 缺 model_id（内部历史已按 model_id 重键，缺即该通道历史不可见）。请运行 cmd/backfillids 回填 monitors.d/", i, modelIDLocation(m))
+		}
+	}
+	return nil
+}
+
+// validateModelIDs 校验监测行稳定 id：非空 model_id 须格式合法（md_<uuidv4>）且全局唯一。
+// 空 model_id 合法——回填前的既有行 / 待 Create 生成，不在此报错（由回填 CLI 与创建路径补齐）。
+func (c *AppConfig) validateModelIDs() error {
+	for i, m := range c.Monitors {
+		if m.ModelID == "" {
+			continue
+		}
+		if !IsValidModelID(m.ModelID) {
+			return fmt.Errorf("monitor[%d] %s: model_id 格式非法 %q（应为 md_<uuidv4>）", i, modelIDLocation(m), m.ModelID)
+		}
+	}
+	// 全局唯一：复用 identity.go 的去重核，撞重 error 已含重复 id。
+	if err := collectModelIDsInto(make(map[string]string), c.Monitors); err != nil {
+		return err
 	}
 	return nil
 }

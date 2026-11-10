@@ -1,4 +1,6 @@
 {
+  "self_serve_visible": false,
+  "model_vendor": "grok",
   "model": "Grok 4.20",
   "request_model": "grok-4.20-0309-non-reasoning",
   "url": "{{BASE_URL}}/v1/chat/completions",
@@ -13,7 +15,10 @@
     "max_tokens": 8,
     "stream": false,
     "messages": [
-      {"role": "user", "content": "ping"}
+      {
+        "role": "user",
+        "content": "ping"
+      }
     ]
   },
   "response": {

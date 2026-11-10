@@ -1,6 +1,8 @@
 {
+	"self_serve_label": "Claude Haiku 4.5（Kiro 逆向线路）",
 	"model": "Haiku",
 	"request_model": "claude-haiku-4-5-20251001",
+	"model_vendor": "anthropic",
 	"url": "{{BASE_URL}}/v1/messages",
 	"method": "POST",
 	"headers": {
@@ -14,7 +16,7 @@
 		"stream": false,
 		"messages": [{
 			"role": "user",
-			"content": "What is the output of this Python code?\n\nprint({{ARITH_A}} + {{ARITH_B}})\n\nReply ONLY: {{EXPECTED_ANSWER}}"
+			"content": "{{PROMPT}}"
 		}]
 	},
 	"response": {

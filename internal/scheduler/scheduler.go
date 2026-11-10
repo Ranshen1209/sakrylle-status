@@ -25,6 +25,60 @@ type task struct {
 	interval time.Duration        // 该任务的巡检间隔
 	nextRun  time.Time            // 下次执行时间
 	index    int                  // 在堆中的索引（heap.Interface 需要）
+	// generation 是本任务被创建时的调度器代次。dispatchDue 把任务弹出堆后会解锁执行探测，
+	// 这段窗口内任务不在堆中；若期间发生 rebuildTasks，堆里已有该监测项的新任务，
+	// 旧任务再无条件推回就会让同一监测项出现两份、每周期被探测两次。回填前比对代次即可丢弃旧任务。
+	generation uint64
+}
+
+// 身份键的两个前缀必须隔开：ModelID 空缺时回退四元组，两套键不能互相碰撞。
+const (
+	taskIdentityModelIDPrefix = "mid\x00"
+	taskIdentityLegacyPrefix  = "pscm\x00"
+)
+
+// taskIdentityKey 返回监测行的身份键，用于跨配置重建时认领同一个监测项。
+//
+// 优先用 ModelID（loader 派生的稳定行级 id，改展示名不变），为空时回退 PSCM 四元组。
+// 不能只用 ModelID：config.validateModelIDs 明确允许空值（回填前的既有行），
+// 且本包是库、单测构造的监测项本来就不填 ModelID——只有 cmd/server 的
+// CheckRuntimeModelIDs 才保证非空。全部空值挤进同一个键会让整组误判为可继承。
+func taskIdentityKey(m config.ServiceConfig) string {
+	if id := strings.TrimSpace(m.ModelID); id != "" {
+		return taskIdentityModelIDPrefix + id
+	}
+	return taskIdentityLegacyPrefix + m.Provider + "\x00" + m.Service + "\x00" + m.Channel + "\x00" + m.Model
+}
+
+// monitorPSCKey 构建 provider/service/channel 组合键。
+// 分组与「重建时按组认领旧相位」两处必须用同一个构造，否则键一旦漂了继承会静默失效。
+func monitorPSCKey(m config.ServiceConfig) string {
+	return fmt.Sprintf("%s/%s/%s", m.Provider, m.Service, m.Channel)
+}
+
+// effectiveInterval 返回监测项的有效巡检间隔（未配置时回退调度器默认值）。
+func effectiveInterval(m config.ServiceConfig, fallback time.Duration) time.Duration {
+	if m.IntervalDuration == 0 {
+		return fallback
+	}
+	return m.IntervalDuration
+}
+
+// taskSchedule 是旧任务的调度字段值快照。
+//
+// 刻意存值而不是 *task：一来 s.tasks[:0] 会复用堆的底层指针数组，二来 dispatchDue
+// 在解锁状态下写被弹出任务的 nextRun，持有指针等于把一个可能被并发写的字段留在手里。
+type taskSchedule struct {
+	nextRun  time.Time
+	interval time.Duration
+}
+
+// groupSchedule 是一个 PSC 组内全部旧任务的快照。
+// duplicate 表示组内出现了重复身份键（正常配置不会发生，但库层不假设调用方已校验），
+// 此时无法可靠地一一认领，整组放弃继承、退回错峰重排。
+type groupSchedule struct {
+	members   map[string]taskSchedule
+	duplicate bool
 }
 
 // monitorGroup 表示一个多模型监测组
@@ -34,6 +88,63 @@ type monitorGroup struct {
 	psc           string // provider/service/channel 组合键
 	monitorIdxs   []int  // 组内监测项在 cfg.Monitors 中的索引（按 layer_order 排序）
 	firstCfgIndex int    // 组内首个监测项的配置索引（用于组间排序）
+}
+
+// snapshotGroupSchedules 在清空任务堆之前，把现有任务按 PSC 组建索引。
+// 必须在 s.tasks = s.tasks[:0] 之前调用。
+func snapshotGroupSchedules(tasks taskHeap) map[string]*groupSchedule {
+	if len(tasks) == 0 {
+		return nil
+	}
+	index := make(map[string]*groupSchedule, len(tasks))
+	for _, t := range tasks {
+		if t == nil {
+			continue
+		}
+		psc := monitorPSCKey(t.monitor)
+		group, ok := index[psc]
+		if !ok {
+			group = &groupSchedule{members: make(map[string]taskSchedule, 4)}
+			index[psc] = group
+		}
+		key := taskIdentityKey(t.monitor)
+		if _, dup := group.members[key]; dup {
+			group.duplicate = true
+			continue
+		}
+		group.members[key] = taskSchedule{nextRun: t.nextRun, interval: t.interval}
+	}
+	return index
+}
+
+// canPreserveGroup 判断某个 PSC 组能否整体沿用旧的 nextRun。
+//
+// 粒度取「组」而非单个任务是刻意的：组内模型按固定 2s 间隔紧凑排布，多模型热力图靠
+// 时间戳对齐渲染，只重排组内一个成员会让那一行错位出空洞。
+// 三个条件缺一不可——组存在、成员身份键集合完全相同（按集合比，不依赖切片顺序）、
+// 每个成员的有效 interval 未变（interval 变了旧相位就不再代表用户想要的节奏）。
+func canPreserveGroup(cfg *config.AppConfig, group monitorGroup, fallback time.Duration, old *groupSchedule) bool {
+	if old == nil || old.duplicate {
+		return false
+	}
+	if len(group.monitorIdxs) != len(old.members) {
+		return false
+	}
+	seen := make(map[string]struct{}, len(group.monitorIdxs))
+	for _, monitorIdx := range group.monitorIdxs {
+		m := cfg.Monitors[monitorIdx]
+		key := taskIdentityKey(m)
+		if _, dup := seen[key]; dup {
+			return false
+		}
+		seen[key] = struct{}{}
+
+		prev, ok := old.members[key]
+		if !ok || prev.interval != effectiveInterval(m, fallback) {
+			return false
+		}
+	}
+	return true
 }
 
 // taskHeap 按下一次触发时间排序的最小堆
@@ -80,6 +191,20 @@ type Scheduler struct {
 	cancel  context.CancelFunc
 	wg      sync.WaitGroup // 追踪在途探测 goroutine
 
+	// inflight 已派发但未结束（排队等并发槽或正在探测）的监测项身份，键为 taskIdentityKey。
+	// 取并发槽在 goroutine 里进行，派发循环不再被饱和的信号量卡住；代价是失去原来的阻塞背压，
+	// 所以同一监测项上一轮没结束时本轮直接跳过，避免排队 goroutine 与重复探测堆积。
+	inflight map[string]struct{}
+
+	// afterPopHook 仅供测试：dispatchDue 弹出任务、释放锁之后调用，用来确定性地撑住「堆外窗口」
+	afterPopHook func()
+
+	// generation 每次重建任务堆（含 Stop）递增，用于识别并丢弃堆外窗口里的旧代任务，见 task.generation
+	generation uint64
+	// lastStaggerEnabled 上一次重建时组间错峰是否生效；切换时强制全量重排，
+	// 否则关掉 stagger_probes 后旧任务会一直留着错峰相位、开关看起来没生效
+	lastStaggerEnabled bool
+
 	// 配置引用（支持热更新）
 	cfg      *config.AppConfig
 	cfgMu    sync.RWMutex
@@ -92,6 +217,7 @@ func NewScheduler(store storage.RecordStorage, interval time.Duration, userIDMgr
 		prober:   monitor.NewProber(store, userIDMgr),
 		fallback: interval,
 		wakeCh:   make(chan struct{}, 1),
+		inflight: make(map[string]struct{}),
 	}
 }
 
@@ -162,7 +288,7 @@ func (s *Scheduler) updateActiveModels(cfg *config.AppConfig) {
 	monitors := cfg.Monitors
 	if autoMover != nil {
 		if overrides := autoMover.Overrides(); len(overrides) > 0 {
-			monitors = automove.ApplyOverrides(monitors, overrides)
+			monitors = automove.ApplyOverrides(monitors, overrides, cfg.AnnotationRules, cfg.IntervalDuration)
 		}
 	}
 	eventSvc.UpdateActiveModels(monitors, cfg.Boards.Enabled)
@@ -196,6 +322,9 @@ func (s *Scheduler) Stop() {
 		s.mu.Unlock()
 		return
 	}
+
+	// 让堆外窗口里的旧代任务失效，避免 Stop 之后 dispatchDue 又把它推回堆里
+	s.generation++
 
 	// 停止定时器
 	if s.timer != nil {
@@ -250,10 +379,21 @@ func (s *Scheduler) rebuildTasks(cfg *config.AppConfig, startup bool) {
 
 	s.mu.Lock()
 	defer s.mu.Unlock()
+
+	// 代次必须在所有 return 路径之前递增：配置被切成空/全禁用时同样要让堆外的旧任务失效
+	s.generation++
+
+	// 必须赶在 s.tasks 被清空之前快照旧相位。startup 时堆本来就是空的，跳过省一次遍历
+	var previousGroups map[string]*groupSchedule
+	if !startup {
+		previousGroups = snapshotGroupSchedules(s.tasks)
+	}
+
 	autoMover := s.autoMover
 
 	monitorCount := len(cfg.Monitors)
 	if monitorCount == 0 {
+		s.lastStaggerEnabled = false
 		s.tasks = s.tasks[:0]
 		s.resetTimerLocked()
 		s.notifyWakeLocked() // 唤醒 loop 以便重新检查状态
@@ -277,6 +417,7 @@ func (s *Scheduler) rebuildTasks(cfg *config.AppConfig, startup bool) {
 
 	// 如果所有监测项都被禁用或冷板，清空任务
 	if activeCount == 0 {
+		s.lastStaggerEnabled = false
 		s.tasks = s.tasks[:0]
 		s.resetTimerLocked()
 		s.notifyWakeLocked()
@@ -385,10 +526,15 @@ func (s *Scheduler) rebuildTasks(cfg *config.AppConfig, startup bool) {
 		}
 	}
 
+	// 错峰开关切换时不继承任何旧相位，让开关立刻反映到全部任务上
+	staggerModeChanged := !startup && useInterGroupStagger != s.lastStaggerEnabled
+
 	// 构建任务堆
 	s.tasks = s.tasks[:0]
 	heap.Init(&s.tasks)
 	now := time.Now()
+
+	preservedGroups := 0
 
 	// 按组遍历，实现组间错峰、组内紧凑
 	for groupIdx, group := range groups {
@@ -398,15 +544,23 @@ func (s *Scheduler) rebuildTasks(cfg *config.AppConfig, startup bool) {
 			groupDelay = computeStaggerDelay(groupBaseDelay, groupJitterRange, groupIdx)
 		}
 
+		// 热更新时尽量沿用旧相位：错峰总展开可能远大于最短巡检周期（生产实测 95 组
+		// 展开 10m33s、最短周期 2m30s），每次热更新都重排等于把短周期通道的下次探测
+		// 推后好几个周期，热力图会因此缺块。组成员与各自 interval 都没变就没有重排的理由。
+		var previous *groupSchedule
+		preserveGroup := false
+		if !startup && !staggerModeChanged {
+			previous = previousGroups[group.psc]
+			preserveGroup = canPreserveGroup(cfg, group, s.fallback, previous)
+			if preserveGroup {
+				preservedGroups++
+			}
+		}
+
 		// 遍历组内监测项（按 layer_order 排序：父层优先）
 		for intraIdx, monitorIdx := range group.monitorIdxs {
 			m := cfg.Monitors[monitorIdx]
-
-			// 使用监测项自己的 interval，为空则使用全局 fallback
-			interval := m.IntervalDuration
-			if interval == 0 {
-				interval = s.fallback
-			}
+			interval := effectiveInterval(m, s.fallback)
 
 			// 计算首次执行时间
 			// 组内紧凑：始终生效，组内模型按 2s 间隔顺序探测
@@ -417,14 +571,40 @@ func (s *Scheduler) rebuildTasks(cfg *config.AppConfig, startup bool) {
 				nextRun = now.Add(groupDelay + intraDelay)
 			}
 
+			switch {
+			case preserveGroup:
+				// canPreserveGroup 已核对过成员集合，正常必定命中。
+				// 仍然判 ok：查不到时零值 time.Time 会让任务立刻到期，
+				// 那是比「多等一轮」严重得多的静默故障，不值得省这一行。
+				if prev, ok := previous.members[taskIdentityKey(m)]; ok {
+					nextRun = prev.nextRun
+				}
+			case !startup:
+				// 热更新里确实需要重排的组：首次延迟封顶到自己的 interval，
+				// 否则缩短 interval 的通道反而要多等一个错峰展开才被探测。
+				// 启动路径刻意不封顶——那时全部任务都要铺开填满周期。
+				if delay := groupDelay + intraDelay; delay > interval {
+					nextRun = now.Add(interval)
+				}
+			}
+
 			heap.Push(&s.tasks, &task{
-				monitor:  m,
-				interval: interval,
-				nextRun:  nextRun,
+				monitor:    m,
+				interval:   interval,
+				nextRun:    nextRun,
+				generation: s.generation,
 			})
 		}
 	}
 
+	if !startup {
+		logger.Info("scheduler", "任务堆已重建",
+			"groups", len(groups), "preserved_groups", preservedGroups,
+			"replanned_groups", len(groups)-preservedGroups,
+			"stagger_mode_changed", staggerModeChanged)
+	}
+
+	s.lastStaggerEnabled = useInterGroupStagger
 	s.resetTimerLocked()
 	s.notifyWakeLocked()
 }
@@ -495,7 +675,7 @@ func buildMonitorGroupsFiltered(cfg *config.AppConfig, extraSkip func(config.Ser
 		}
 
 		// 构建 PSC 键
-		psc := fmt.Sprintf("%s/%s/%s", m.Provider, m.Service, m.Channel)
+		psc := monitorPSCKey(m)
 
 		entry, exists := pscMap[psc]
 		if !exists {
@@ -615,9 +795,14 @@ func (s *Scheduler) dispatchDue() {
 
 		// 弹出到期任务
 		heap.Pop(&s.tasks)
+		afterPop := s.afterPopHook
 		s.mu.Unlock()
 
-		// 异步执行探测任务
+		if afterPop != nil {
+			afterPop()
+		}
+
+		// 登记后立即返回，探测在 goroutine 里等并发槽
 		s.runTask(next)
 
 		// 使用"至少间隔"语义：下次执行时间 = max(计划时间+interval, 当前时间+interval)
@@ -630,39 +815,55 @@ func (s *Scheduler) dispatchDue() {
 			next.nextRun = plannedNext
 		}
 
-		// 重新入队
+		// 重新入队。堆外窗口期间可能发生 rebuildTasks/Stop，此时堆里要么已有该监测项的
+		// 新任务、要么整个调度已停；无条件推回会让同一监测项每周期被探测两次（见 task.generation）
 		s.mu.Lock()
-		heap.Push(&s.tasks, next)
+		if next.generation == s.generation && s.running {
+			heap.Push(&s.tasks, next)
+		}
+		// 丢弃旧任务时同样要按当前堆重置定时器
 		s.resetTimerLocked()
 		s.mu.Unlock()
 	}
 }
 
-// runTask 在并发控制下执行单个探测任务
+// runTask 登记并异步执行单个探测任务，并发槽在 goroutine 内等待，不阻塞派发循环
 func (s *Scheduler) runTask(t *task) {
+	key := taskIdentityKey(t.monitor)
+
 	s.mu.Lock()
+	if !s.running || s.ctx == nil || s.sem == nil {
+		s.mu.Unlock()
+		return
+	}
+	if _, busy := s.inflight[key]; busy {
+		s.mu.Unlock()
+		logger.Warn("scheduler", "上一轮探测仍在排队或执行，跳过本轮（并发上限可能不足）",
+			"provider", t.monitor.Provider, "service", t.monitor.Service, "channel", t.monitor.Channel, "model", t.monitor.Model)
+		return
+	}
 	ctx := s.ctx
 	sem := s.sem
 	eventSvc := s.eventService
+	s.inflight[key] = struct{}{}
+	// 必须与上面的 running 检查同在 s.mu 内 Add：Stop 持锁置 running=false 后才 wg.Wait，
+	// 锁外 Add 可能与 Wait 并发，违反 WaitGroup 的使用约束
+	s.wg.Add(1)
 	s.mu.Unlock()
 
-	if ctx == nil || sem == nil {
-		return
-	}
-
-	// 获取信号量
-	select {
-	case sem <- struct{}{}:
-	case <-ctx.Done():
-		return
-	}
-
-	// 追踪在途 goroutine
-	s.wg.Add(1)
-
-	// 异步执行，释放信号量
 	go func(m config.ServiceConfig) {
 		defer s.wg.Done()
+		defer func() {
+			s.mu.Lock()
+			delete(s.inflight, key)
+			s.mu.Unlock()
+		}()
+
+		select {
+		case sem <- struct{}{}:
+		case <-ctx.Done():
+			return
+		}
 		defer func() { <-sem }()
 
 		result := s.prober.Probe(ctx, &m)

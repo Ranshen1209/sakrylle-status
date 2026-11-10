@@ -53,6 +53,11 @@ func (c *AppConfig) normalize() error {
 		return err
 	}
 
+	// 9. 展示名唯一性：必须在 trim 与父子继承之后，才与 /api/status 下发的口径一致
+	if err := c.validateMonitorDisplayKeyUniqueness(); err != nil {
+		return err
+	}
+
 	return nil
 }
 
@@ -186,6 +191,18 @@ func (c *AppConfig) normalizeGlobalDefaults() error {
 	}
 	if c.DegradedWeight < 0 || c.DegradedWeight > 1 {
 		return fmt.Errorf("degraded_weight 必须在 0 到 1 之间（0 表示使用默认值 0.7），当前值: %.2f", c.DegradedWeight)
+	}
+
+	// 可信代理边界：未配置时只信本机回环（cloudflared / nginx sidecar 的典型部署形态），
+	// 绝不回落到 gin 默认的"信任所有代理"——那会让任何人伪造 X-Forwarded-For 顶替客户端 IP。
+	if len(c.Server.TrustedProxies) == 0 {
+		c.Server.TrustedProxies = append([]string(nil), defaultTrustedProxies...)
+	} else {
+		// 就地 trim：校验与实际交给 gin 的必须是同一个字符串，否则 " 127.0.0.1 " 会
+		// 过了加载期校验、却在运行时解析失败而触发收紧兜底（行为正确但与文档承诺不符）
+		for i, entry := range c.Server.TrustedProxies {
+			c.Server.TrustedProxies[i] = strings.TrimSpace(entry)
+		}
 	}
 
 	// 公开访问的基础 URL（默认 https://relaypulse.top）
@@ -385,9 +402,15 @@ func (c *AppConfig) normalizeChangeRequestConfig() {
 	}
 }
 
-// normalizeOnboardingConfig 规范化自助收录配置
+// normalizeOnboardingConfig 规范化自助收录配置。
+//
+// 注意：admin_token / encryption_key / proof_secret / proof_ttl 这组密钥是 onboarding 与
+// change_requests **共享**的（见 ChangeRequestConfig 注释；main.go 的变更请求初始化也读
+// cfg.Onboarding.* 这几项）。因此只要任一功能启用就必须在此完成默认值填充与必填校验——
+// 否则 change_requests 单开（onboarding 关闭）时 ProofTTLDuration 会留零值，proof 签发即刻
+// 过期，变更提交全被拒。
 func (c *AppConfig) normalizeOnboardingConfig() error {
-	if !c.Onboarding.Enabled {
+	if !c.Onboarding.Enabled && !c.ChangeRequests.Enabled {
 		return nil
 	}
 

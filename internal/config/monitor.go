@@ -22,11 +22,18 @@ type ServiceConfig struct {
 	Annotations  []Annotation `yaml:"-" json:"annotations,omitempty"`               // 统一注解（系统派生 + annotation_rules）
 	Channel      string       `yaml:"channel" json:"channel"`                       // 业务通道标识（如 "vip-channel"），用于分类和过滤
 	Model        string       `yaml:"model" json:"model,omitempty"`                 // 模型系列名（展示/DB 键；可由 template 提供，config 可覆盖）
+	ModelID      string       `yaml:"model_id,omitempty" json:"model_id,omitempty"` // 监测行稳定唯一 id（md_<uuidv4>），系统生成、不可变；与 Model 一样不参与父子继承。Phase 1 起作内部存储键
+	ChannelID    string       `yaml:"-" json:"-"`                                   // 运行时注入：所属文件 channel_id 下沉到行（loadMonitorsDir），不持久化，经 MonitorResult.channel_id 暴露
 	RequestModel string       `yaml:"request_model,omitempty" json:"-"`             // 实际请求模型 ID（注入 {{MODEL}}/{{REQUEST_MODEL}}，为空时回退 Model）
-	Parent       string       `yaml:"parent" json:"parent,omitempty"`               // 父通道引用，格式 provider/service/channel
-	ChannelName  string       `yaml:"channel_name" json:"channel_name,omitempty"`   // Channel 显示名称（可选，未配置时回退到 channel）
-	ListedSince  string       `yaml:"listed_since,omitempty" json:"listed_since"`   // 收录日期（可选，格式 "2006-01-02"），用于计算收录天数
-	ExpiresAt    string       `yaml:"expires_at" json:"expires_at,omitempty"`       // 到期日期（可选，格式 "2006-01-02"），过期后自动降级并移入备板
+	// ModelVendor 模型厂商受控 code（词表见 internal/modelvendor），是**行级**属性：同一通道的
+	// 各 model 层可属于不同厂商。取值链 config 行级 > template；父子继承只对非 native 模板
+	// 生效（native 子行必须自己写，理由见 inheritCoreBehavior）。
+	// 与 Model 不同的是它会被继承：Model 是父子的区分字段，vendor 是可共享的默认值。
+	ModelVendor string `yaml:"model_vendor,omitempty" json:"model_vendor,omitempty"`
+	Parent      string `yaml:"parent" json:"parent,omitempty"`             // 父通道引用，格式 provider/service/channel
+	ChannelName string `yaml:"channel_name" json:"channel_name,omitempty"` // Channel 显示名称（可选，未配置时回退到 channel）
+	ListedSince string `yaml:"listed_since,omitempty" json:"listed_since"` // 收录日期（可选，格式 "2006-01-02"），用于计算收录天数
+	ExpiresAt   string `yaml:"expires_at" json:"expires_at,omitempty"`     // 到期日期（可选，格式 "2006-01-02"），过期后赞助等级降为 pulse（板块由可用率决定，不随到期变动）
 	// Template 引用 templates/<name>.json 模板，定义完整的请求方式（url/method/headers/body/response）
 	Template string `yaml:"template" json:"template,omitempty"`
 
@@ -57,7 +64,7 @@ type ServiceConfig struct {
 
 	// 自定义巡检间隔（可选，留空则使用全局 interval）
 	// 支持 Go duration 格式，例如 "30s"、"1m"、"5m"
-	// 付费高频监测可使用更短间隔
+	// 商务/赞助等级可按需配置更短间隔
 	Interval string `yaml:"interval,omitempty" json:"interval"`
 
 	// 彻底停用配置：不探测、不存储、不展示
@@ -70,10 +77,15 @@ type ServiceConfig struct {
 	Hidden       bool   `yaml:"hidden,omitempty" json:"hidden"`
 	HiddenReason string `yaml:"hidden_reason,omitempty" json:"hidden_reason"` // 下架原因（可选）
 
-	// 热板/冷板配置：冷板项停止探测，仅展示历史数据（需 boards.enabled=true）
-	// Board 可选值：空/"hot"（默认热板）、"cold"（冷板）
+	// 热板/备板/冷板配置：冷板项停止探测，仅展示历史数据（需 boards.enabled=true）
+	// Board 可选值：空/"hot"（默认主板）、"secondary"（备板）、"cold"（冷板）。
+	// 配置板位是自动移板的"锚点/天花板"：board=secondary 不会被自动升 hot（详见 BoardAutoMoveConfig）。
 	Board      string `yaml:"board,omitempty" json:"board"`
 	ColdReason string `yaml:"cold_reason" json:"cold_reason,omitempty"` // 冷板原因（可选）
+
+	// 质量移板运行时字段（yaml:"-" 不持久化到 monitors.d，由 automove 在运行时注入）。
+	BoardReason       string `yaml:"-" json:"board_reason,omitempty"`        // 移板机器码（如 "quality_hardfail"），前端本地化；运行时注入
+	BoardReasonModels string `yaml:"-" json:"board_reason_models,omitempty"` // 触发质量移板的模型名（逗号连接）；运行时注入
 
 	// AutoColdExempt 手动解除自动冷板。
 	// 设为 true 时会清除 runtime cold override，并在保持为 true 期间不再自动移入冷板。

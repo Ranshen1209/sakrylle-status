@@ -11,6 +11,7 @@ import (
 	"sync/atomic"
 	"testing"
 	"time"
+	"unicode/utf8"
 
 	"github.com/andybalholm/brotli"
 	"github.com/klauspost/compress/zstd"
@@ -133,11 +134,12 @@ func TestDetermineStatus(t *testing.T) {
 	}{
 		{"200_fast", 200, 50, 1, storage.SubStatusNone},
 		{"200_slow", 200, 200, 2, storage.SubStatusSlowLatency},
-		{"200_at_threshold", 200, 100, 1, storage.SubStatusNone}, // equal to threshold, not exceeding
-		{"201_created", 201, 10, 1, storage.SubStatusNone},       // other 2xx
-		{"204_no_content", 204, 10, 1, storage.SubStatusNone},    // other 2xx
-		{"301_redirect", 301, 10, 1, storage.SubStatusNone},      // 3xx
-		{"302_redirect", 302, 10, 1, storage.SubStatusNone},      // 3xx
+		{"200_at_threshold", 200, 100, 1, storage.SubStatusNone},   // equal to threshold, not exceeding
+		{"201_created", 201, 10, 1, storage.SubStatusNone},         // other 2xx
+		{"204_no_content", 204, 10, 1, storage.SubStatusNone},      // other 2xx
+		{"301_redirect", 301, 10, 0, storage.SubStatusClientError}, // 3xx 判红：client 已自动跟随合规重定向，漏到此处的是畸形重定向
+		{"302_redirect", 302, 10, 0, storage.SubStatusClientError}, // 同上
+		{"304_not_modified", 304, 10, 0, storage.SubStatusClientError},
 		{"400_bad_request", 400, 10, 0, storage.SubStatusInvalidRequest},
 		{"401_unauthorized", 401, 10, 0, storage.SubStatusAuthError},
 		{"403_forbidden", 403, 10, 0, storage.SubStatusAuthError},
@@ -756,4 +758,221 @@ func mustDeflate(t *testing.T, data []byte) []byte {
 		t.Fatalf("deflate close: %v", err)
 	}
 	return buf.Bytes()
+}
+
+// TestProbe_ContentMismatchSnippetIsDiagnostic 端到端锁住调度器侧的摘要形态：
+// 上游 200 开了 SSE 流却没产出任何正文（生产上 saiai/cx 那条 GPT-5.6-Luna 的真实形态）。
+// 旧实现在这里写库的是响应体**头部**——恒定的 response.created 握手，排障时等于没有。
+func TestProbe_ContentMismatchSnippetIsDiagnostic(t *testing.T) {
+	prober := NewProber(nil, nil)
+	defer prober.Close()
+
+	// 握手事件塞长，逼摘要必须做截断选择；真正的失败原因只在尾部
+	padding := strings.Repeat("x", 600)
+	body := "event: response.created\n" +
+		`data: {"type":"response.created","response":{"id":"resp_` + padding + `","status":"in_progress","error":null}}` + "\n\n" +
+		"event: response.failed\n" +
+		`data: {"type":"response.failed","response":{"status":"failed","error":{"message":"upstream closed"}}}` + "\n\n"
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.WriteHeader(200)
+		_, _ = w.Write([]byte(body))
+	}))
+	defer srv.Close()
+
+	cfg := newTestCfg(srv.URL)
+	cfg.SuccessContains = "RP_ANSWER=79"
+
+	result := prober.Probe(context.Background(), &cfg)
+	if result.Status != 0 || result.SubStatus != storage.SubStatusContentMismatch {
+		t.Fatalf("want (0, content_mismatch), got (%d, %s)", result.Status, result.SubStatus)
+	}
+
+	for _, want := range []string{
+		`expected="RP_ANSWER=79"`,
+		"extracted=0chars",
+		"last_event=response.failed",
+		`error="upstream closed"`,
+	} {
+		if !strings.Contains(result.ResponseSnippet, want) {
+			t.Errorf("写库摘要缺少 %q\n实际:\n%s", want, result.ResponseSnippet)
+		}
+	}
+	if strings.HasPrefix(result.ResponseSnippet, "event: response.created") {
+		t.Errorf("摘要不该再是响应体头部，实际:\n%s", result.ResponseSnippet)
+	}
+}
+
+// TestProbe_ContentMismatchSnippetRecordsRandomizedKeyword 固定「每次重试都换一道随机题、
+// 摘要必须记的是最后一次那道」这条契约：不记就无法事后复核判红是否正确。
+func TestProbe_ContentMismatchSnippetRecordsRandomizedKeyword(t *testing.T) {
+	prober := NewProber(nil, nil)
+	defer prober.Close()
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(200)
+		_, _ = w.Write([]byte(`{"answer":"nope"}`))
+	}))
+	defer srv.Close()
+
+	cfg := newTestCfg(srv.URL)
+	cfg.Method = http.MethodPost
+	cfg.Body = `{"prompt":"{{PROMPT}}"}`
+	cfg.SuccessContains = "{{EXPECTED_ANSWER}}"
+
+	result := prober.Probe(context.Background(), &cfg)
+	if result.SubStatus != storage.SubStatusContentMismatch {
+		t.Fatalf("want content_mismatch, got %s", result.SubStatus)
+	}
+	// 占位符必须已被注入后的真实关键字替换，而不是原样落进摘要
+	if strings.Contains(result.ResponseSnippet, "{{EXPECTED_ANSWER}}") {
+		t.Errorf("摘要记的应是注入后的关键字，实际:\n%s", result.ResponseSnippet)
+	}
+	if !strings.Contains(result.ResponseSnippet, `expected="RP_ANSWER=`) {
+		t.Errorf("摘要应带上本次随机题的预期答案，实际:\n%s", result.ResponseSnippet)
+	}
+}
+
+// TestProbe_SnippetIsAlwaysValidUTF8 —— 摘要要写进 Postgres 的 error_detail(TEXT)，
+// 而 Postgres 会以 `invalid byte sequence for encoding "UTF8"` 拒收非法字节序列，
+// 那会让**整条探测记录**写不进库。响应体在 readBodyPrefixAndDrain 处按 512 **字节**
+// 截取，非 ASCII 的上游错误体必然可能被从字符中间劈开。
+func TestProbe_SnippetIsAlwaysValidUTF8(t *testing.T) {
+	prober := NewProber(nil, nil)
+	defer prober.Close()
+
+	// 中文错误体远超 512 字节的捕获上限，截断点几乎必然落在汉字中间
+	longChinese := `{"error":"` + strings.Repeat("上游服务暂时不可用", 100) + `"}`
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(500)
+		_, _ = w.Write([]byte(longChinese))
+	}))
+	defer srv.Close()
+
+	cfg := newTestCfg(srv.URL)
+	result := prober.Probe(context.Background(), &cfg)
+	if result.Status != 0 {
+		t.Fatalf("want red, got %d", result.Status)
+	}
+	if !utf8.ValidString(result.ResponseSnippet) {
+		t.Errorf("写库摘要含非法 UTF-8，Postgres 会拒收整条记录\n摘要尾部: %q",
+			result.ResponseSnippet[max(0, len(result.ResponseSnippet)-16):])
+	}
+}
+
+// --- 响应体读取上限（MaxResponseBodyBytes）---
+
+func TestReadBodyLimited(t *testing.T) {
+	t.Parallel()
+
+	data, truncated, err := readBodyLimited(strings.NewReader("abcdef"), 6)
+	if err != nil || truncated || string(data) != "abcdef" {
+		t.Fatalf("exact-limit body must not be truncated: data=%q truncated=%v err=%v", data, truncated, err)
+	}
+	data, truncated, err = readBodyLimited(strings.NewReader("abcdefg"), 6)
+	if err != nil || !truncated || string(data) != "abcdef" {
+		t.Fatalf("over-limit body must be cut at limit: data=%q truncated=%v err=%v", data, truncated, err)
+	}
+}
+
+// 答案落在已读前段：截断不影响判绿。
+func TestProbe_OversizedBodyAnswerInPrefixStaysHealthy(t *testing.T) {
+	prober := NewProber(nil, nil)
+	defer prober.Close()
+	prober.SetMaxResponseBodyBytes(1024)
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(200)
+		_, _ = w.Write([]byte("pong"))
+		_, _ = w.Write(bytes.Repeat([]byte("x"), 256<<10))
+	}))
+	defer srv.Close()
+
+	cfg := newTestCfg(srv.URL)
+	cfg.SuccessContains = "pong"
+
+	result := prober.Probe(context.Background(), &cfg)
+	if result.Status == 0 || result.SubStatus == storage.SubStatusContentMismatch {
+		t.Fatalf("answer inside the capped prefix must still pass, got (%d, %s)", result.Status, result.SubStatus)
+	}
+}
+
+// 响应体里没有答案：截断后按已读前段判 content_mismatch，摘要首行标注已截断且长度受控。
+func TestProbe_OversizedBodyWithoutAnswerIsMismatchWithTruncationNote(t *testing.T) {
+	prober := NewProber(nil, nil)
+	defer prober.Close()
+	prober.SetMaxResponseBodyBytes(1024)
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(200)
+		_, _ = w.Write(bytes.Repeat([]byte("x"), 256<<10))
+	}))
+	defer srv.Close()
+
+	cfg := newTestCfg(srv.URL)
+	cfg.SuccessContains = "pong"
+
+	result := prober.Probe(context.Background(), &cfg)
+	if result.Status != 0 || result.SubStatus != storage.SubStatusContentMismatch {
+		t.Fatalf("want (0, content_mismatch), got (%d, %s)", result.Status, result.SubStatus)
+	}
+	if !strings.HasPrefix(result.ResponseSnippet, "response_truncated: ") {
+		t.Errorf("snippet must start with the truncation note, got %q", result.ResponseSnippet)
+	}
+	if len(result.ResponseSnippet) > 4096 {
+		t.Errorf("snippet must stay bounded after truncation, got %d bytes", len(result.ResponseSnippet))
+	}
+}
+
+// 解压炸弹：几 KB 的 gzip 体解压出几 MB，解压输出同样受上限约束。
+func TestProbe_DecompressionBombIsCapped(t *testing.T) {
+	prober := NewProber(nil, nil)
+	defer prober.Close()
+	prober.SetMaxResponseBodyBytes(64 << 10)
+
+	bomb := mustGzip(t, bytes.Repeat([]byte{0}, 8<<20))
+	if len(bomb) >= 64<<10 {
+		t.Fatalf("test premise broken: compressed bomb is %d bytes, must be far below the 64KiB cap", len(bomb))
+	}
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Encoding", "gzip")
+		w.WriteHeader(200)
+		_, _ = w.Write(bomb)
+	}))
+	defer srv.Close()
+
+	cfg := newTestCfg(srv.URL)
+	cfg.SuccessContains = "pong"
+	cfg.Headers["Accept-Encoding"] = "gzip" // 显式声明让 Transport 不自动解压，走探针自己的解压路径
+
+	result := prober.Probe(context.Background(), &cfg)
+	if result.Status != 0 || result.SubStatus != storage.SubStatusContentMismatch {
+		t.Fatalf("want (0, content_mismatch), got (%d, %s)", result.Status, result.SubStatus)
+	}
+	if !strings.HasPrefix(result.ResponseSnippet, "response_truncated: ") {
+		t.Errorf("decompression overflow must be reported as truncation, got %q", result.ResponseSnippet)
+	}
+}
+
+// 非 2xx 红态：截断不改变按 HTTP 状态码的分类。
+func TestProbe_OversizedNon2xxKeepsHTTPClassification(t *testing.T) {
+	prober := NewProber(nil, nil)
+	defer prober.Close()
+	prober.SetMaxResponseBodyBytes(1024)
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(500)
+		_, _ = w.Write(bytes.Repeat([]byte("e"), 256<<10))
+	}))
+	defer srv.Close()
+
+	cfg := newTestCfg(srv.URL)
+	cfg.SuccessContains = "pong"
+
+	result := prober.Probe(context.Background(), &cfg)
+	if result.Status != 0 || result.SubStatus != storage.SubStatusServerError {
+		t.Fatalf("want (0, server_error), got (%d, %s)", result.Status, result.SubStatus)
+	}
 }

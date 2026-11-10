@@ -12,6 +12,7 @@
     "close": "閉じる",
     "apply": "フィルターを適用",
     "clear": "すべてのフィルターをクリア",
+    "save": "保存",
     "sponsor": "スポンサー",
     "channel": "チャネル",
     "latency": "レイテンシ",
@@ -41,12 +42,14 @@
     }
   },
   "header": {
-    "brand": "Sakrylle Status",
     "tagline": "Sakrylle API のサービス可用性モニタ",
+    "contactBtn": "お問い合わせ",
+    "contactBtnShort": "問合せ",
     "stats": {
       "healthy": "正常稼働",
       "issues": "異常アラート"
-    }
+    },
+    "brand": "Sakrylle Status"
   },
   "controls": {
     "filters": {
@@ -54,7 +57,9 @@
       "categoryLabel": "サービスカテゴリ",
       "provider": "すべてのプロバイダ",
       "service": "すべてのサービス",
-      "channel": "すべてのチャネル"
+      "channel": "すべてのチャネル",
+      "vendor": "すべてのベンダー",
+      "model": "すべてのモデル"
     },
     "categories": {
       "charity": "チャリティサイト",
@@ -130,6 +135,10 @@
       "disabled": "自動更新：一時停止中",
       "enabledHint": "自動更新中、クリックで一時停止",
       "disabledHint": "一時停止中、クリックで再開"
+    },
+    "drawings": {
+      "show": "イラスト列を表示",
+      "hide": "イラスト列を非表示"
     }
   },
   "favorites": {
@@ -142,17 +151,23 @@
     }
   },
   "table": {
+    "qualityHintLink": "中継品質検出",
     "headers": {
       "annotation": "アノテーション",
       "provider": "プロバイダ",
       "sponsor": "スポンサー",
       "service": "サービス",
+      "serviceTooltip": "「サービス」列が示すのは接続プロトコル系統です。CC は Anthropic Messages API（Claude Code）、CX は OpenAI API（Codex CLI）、GM は Gemini API。実際のモデルの提供元は、各モデル名の前にあるベンダーアイコンで確認できます。",
       "channel": "チャネル",
       "model": "モデル",
       "priceRatio": "価格",
       "priceRatioLine1": "価格",
       "priceRatioLine2": "¥/$",
       "priceRatioTooltip": "1ドル分のトークンに何人民元必要か、参考値",
+      "quality": "品質",
+      "qualityTooltip": "<diag>diag.relaypulse.top</diag> が独立にサンプリングした品質スコア（0-100）。チャネル内の各モデルが 5 点スパークライン（30日平均 / 7日平均 / 直近 3 サンプル）を重ねて描画。80 / 100 の 2 本の補助線が Y 軸の目盛りとして機能します。",
+      "drawing": "イラスト",
+      "drawingTooltip": "rpdiag の直近 3 回のスコア付きテストでモデルが描いた「自転車に乗るペリカン」の SVG です。セルには最新の 1 枚（7 日より古いと薄く表示）、マウスを重ねると 3 枚を表示し、右下の小さな画像は同じグループの公式モデルの絵です。画風は目安にすぎません。",
       "listedDays": "掲載日数",
       "listedDaysLine1": "掲載",
       "listedDaysLine2": "日数",
@@ -168,7 +183,8 @@
       "lastCheck": "状態/レイテンシ",
       "service": "サービス種別",
       "priceRatio": "価格",
-      "listedDays": "掲載"
+      "listedDays": "掲載",
+      "quality": "品質"
     },
     "categoryLabels": {
       "promoted": "商用サイト",
@@ -180,14 +196,17 @@
     },
     "expandDetails": "詳細を表示",
     "collapseDetails": "詳細を閉じる",
+    "qualityPending": "測定待ち",
+    "qualityPendingTooltip": "監視中ですが、rpdiag はまだこのチャネルの品質をサンプリングしていません（順番が来次第測定します）。",
     "heatmapHint": "色のブロックをクリックすると詳細情報を表示します（{{from}} → {{to}} 個のデータポイントを集約）",
     "timeLabels": {
       "24h": "24h",
       "days": "{{count}}d"
     },
+    "modelVendorTooltip": "モデルベンダー: {{vendor}}（{{code}}）。このチャネルで実際に動くモデルの提供元で、「サービス」列の接続プロトコルとは別の軸です。",
     "channelType": {
-      "official": "公式チャネル",
-      "officialDesc": "プロバイダが公式APIの使用を主張",
+      "official": "公式直結 / 公式リセール",
+      "officialDesc": "プロバイダがベンダー公式エンドポイントへの直結、または公式リセール（クラウド等）であり、リバースでも混合でもないと表記",
       "reverse": "リバースチャネル",
       "reverseDesc": "プロバイダがリバースエンジニアリングと表記",
       "mixed": "混合チャネル",
@@ -199,9 +218,24 @@
       "channelType": "チャネルタイプ",
       "probeUrl": "探測URL",
       "template": "リクエストテンプレート",
-      "coldReason": "コールド理由"
+      "coldReason": "コールド理由",
+      "qualityHardFail": {
+        "label": "品質による移動",
+        "text": "{{models}} は直近3回の評価で採点可能な応答が得られず、予備ボードへ移動しました",
+        "textNoModels": "直近3回の評価で採点可能な応答が得られず、予備ボードへ移動しました"
+      }
     },
-    "filterByProvider": "このプロバイダーでフィルター"
+    "filterByProvider": "このプロバイダーでフィルター",
+    "drawing": {
+      "tooltipNote": "1 枚だけでは判断できません。公式モデルも異なる画風で描くことがあります。右下の小さな画像は同じグループの公式の絵です。",
+      "moreLink": "rpdiag で見る",
+      "latestAlt": "最新のスコア付きテストのイラスト（{{time}}）",
+      "staleAlt": "最新のスコア付きテストから 7 日以上経過しています（{{time}}）。最近のテストはスコアが出ていません",
+      "candidateAlt": "このチャネルのイラスト（{{time}}）",
+      "officialAlt": "同じグループの公式イラスト",
+      "failed": "描画失敗",
+      "none": "イラストなし"
+    }
   },
   "card": {
     "uptime": "稼働率:"
@@ -221,7 +255,10 @@
     "invalid_request": "リクエストパラメータのエラー",
     "network_error": "接続に失敗しました",
     "response_timeout": "応答タイムアウト",
-    "content_mismatch": "内容検証に失敗しました"
+    "content_mismatch": "内容検証に失敗しました",
+    "redirect_blocked": "リダイレクトがブロックされました",
+    "response_too_large": "レスポンスが大きすぎます",
+    "concurrency_limited": "同時実行数制限"
   },
   "tooltip": {
     "title": "データの詳細",
@@ -234,7 +271,28 @@
     "httpCodeBreakdown": "HTTPコード内訳"
   },
   "footer": {
-    "githubAria": "GitHub"
+    "detectLink": "中継検出",
+    "disclaimer": {
+      "title": "プラットフォーム声明",
+      "dataReference": {
+        "title": "実消費ベースのプローブ",
+        "text": "実際のトークン消費に基づき計測を実行。結果は当時のネットワーク状況とプロバイダー負荷に左右され、API応答品質を忠実に反映します"
+      },
+      "neutralMaintenance": {
+        "title": "オープンで透明な運用",
+        "text": "全コードはMITライセンスで完全オープンソース、セルフホストで検証可能。スポンサーは置頂表示、専用タグ、高頻度モニタリングを享受できますが、可用率などの監視データは常に客観的かつ正確です"
+      },
+      "monitoringScope": {
+        "title": "フルスタックプロトコル検証",
+        "text": "TCP接続性、RTT遅延、応答内容の深部検証をカバーし、接続可能でも対話できない「フェイク稼働」APIを的確に検知します"
+      },
+      "liability": {
+        "title": "免責事項",
+        "text": "監視データは技術的な参考情報であり、第三者サービス提供者の信頼性や資金の安全性を保証するものではありません。ユーザーは自己責任でサービス提供者と取引してください"
+      }
+    },
+    "issuesBtn": "問題を報告",
+    "openSourceLabel": "オープンソースプロジェクトです。ぜひコントリビュートしてください"
   },
   "provider": {
     "pageTitle": "{{name}} - サービス監視",
@@ -258,6 +316,12 @@
     "composite": "総合",
     "modelPrefix": "🔄"
   },
+  "share": {
+    "share": "共有",
+    "shareShort": "共有",
+    "linkCopied": "リンクをクリップボードにコピーしました",
+    "copyFailed": "コピーに失敗しました。リンクを手動でコピーしてください"
+  },
   "externalLink": {
     "title": "Sakrylle Status を離れます",
     "target": "移動先",
@@ -275,14 +339,19 @@
     "switchTheme": "テーマを切替",
     "selectTheme": "テーマを選択",
     "defaultDark": "デフォルトダーク",
+    "nightDark": "ナイトダーク",
     "lightCool": "ライトクール",
+    "lightWarm": "ライトウォーム",
     "defaultDarkShort": "暗い",
-    "lightCoolShort": "涼色"
+    "nightDarkShort": "夜間",
+    "lightCoolShort": "涼色",
+    "lightWarmShort": "暖色"
   },
   "community": {
     "title": "コミュニティ",
     "items": {
-      "qqGroup": "QQ グループ"
+      "qqGroup": "QQ グループ",
+      "telegramGroup": "Telegram グループ"
     },
     "groupNumber": "グループID",
     "joinLink": "参加する",
@@ -294,6 +363,254 @@
     "close": "閉じる",
     "discussions": "ディスカッション",
     "moreAnnouncements": "他 {{count}} 件のお知らせ"
+  },
+  "onboarding": {
+    "meta": {
+      "title": "掲載申請",
+      "description": "APIサービスをSakrylle Statusモニタリングプラットフォームに登録"
+    },
+    "title": "掲載申請",
+    "description": "APIサービス情報を入力し、接続テストに合格して申請してください",
+    "loading": "フォーム設定を読み込み中...",
+    "metaErrorHint": "この機能はまだ有効になっていない可能性があります。管理者にお問い合わせください。",
+    "steps": {
+      "provider": "プロバイダー",
+      "connection": "テスト",
+      "confirm": "確認"
+    },
+    "next": "次へ",
+    "back": "戻る",
+    "providerInfo": {
+      "title": "プロバイダー情報",
+      "agreementText": "以下に同意します：",
+      "agreementLink": "掲載規約",
+      "providerName": "プロバイダー名",
+      "providerNamePlaceholder": "例：MyService",
+      "websiteUrl": "ウェブサイトURL",
+      "category": "カテゴリ",
+      "categories": {
+        "commercial": "商用",
+        "public": "公共"
+      },
+      "serviceType": "サービスタイプ",
+      "serviceTypes": {
+        "cc": "CC",
+        "cx": "CX",
+        "gm": "GM"
+      },
+      "identity": "ユーザー種別",
+      "identities": {
+        "publicOwner": "公益サイトオーナー",
+        "publicOwnerDesc": "テストや研究のための公益サイトを申請、無料で参加",
+        "commercialOwner": "商用サイトオーナー",
+        "commercialOwnerDesc": "商用サイトを申請し、プラットフォームを通じて集客",
+        "personal": "個人ユーザー",
+        "personalDesc": "優秀なリレーサイトを推薦し、アフィリエイトリンクで報酬を獲得"
+      },
+      "sponsorLevel": "スポンサーレベル",
+      "sponsorLevels": {
+        "public": "パブリック",
+        "signal": "シグナル",
+        "pulse": "パルス"
+      },
+      "channelType": "チャネルタイプ",
+      "channelTypes": {
+        "O": "公式",
+        "ODesc": "自前のアカウントプールで公式上流（サブスク / 公式 API / クラウド）に直接接続。リバースや第三者バックアップは含みません。",
+        "R": "リバース",
+        "RDesc": "リバース Web セッションやスクリプトなど非公式な手段で上流に接続。",
+        "M": "混合",
+        "MDesc": "公式・リバースなど複数種類の上流を併用、または第三者バックアップ / 予備プールを含む。"
+      },
+      "channelSource": "チャネルソース",
+      "customSource": "カスタム...",
+      "customSourcePlaceholder": "カスタムソースを入力",
+      "channelSourceCustomPlaceholder": "ソース名を入力（大文字/数字）",
+      "providerNameHint": "プロバイダーの表示名です。中国語を含む任意の言語に対応（最大100文字）。英字以外の文字を含む場合、URL用の英字コードは運営側で割り当てます。",
+      "channelSourcePlaceholder": "アクセスソースを選択",
+      "channelSourceHint": "適切なソースがない場合は運営までご連絡ください（QQ:18058344）",
+      "channelName": "チャネル表示名",
+      "channelNamePlaceholder": "例：Max 高速回線",
+      "channelNameHint": "ステータスページのチャネル欄に表示されます（Unicode 対応）。空欄の場合はチャネル識別子を表示。最大 {{max}} 文字",
+      "channelNameInvalid": "{{max}} 文字以内で、制御文字やゼロ幅文字は使用できません",
+      "channelGroup": "チャネルグループコード",
+      "channelGroupHint": "1～8 文字の小文字英数字。チャネル識別子の生成にのみ使用し、表示名にはなりません（例：us、eu、v2）。空欄の場合は main",
+      "sourceCategories": {
+        "subscription": "サブスクリプション",
+        "official": "公式 API",
+        "cloud": "クラウド",
+        "reverse": "リバース",
+        "mixed": "混合"
+      },
+      "channelCodePreview": "チャネルコードプレビュー",
+      "optional": "（任意）"
+    },
+    "connectionTest": {
+      "title": "接続テスト",
+      "description": "API情報を入力してテストを実行してください",
+      "baseUrl": "APIベースURL",
+      "baseUrlHint": "HTTPSが必須です",
+      "apiKey": "APIキー",
+      "apiKeyPlaceholder": "APIキーを入力",
+      "apiKeyHint": "検証とモニタリングのみに使用、暗号化保存",
+      "showApiKey": "APIキーを表示",
+      "hideApiKey": "APIキーを非表示",
+      "testType": "サービスタイプ",
+      "runTest": "テスト実行",
+      "rerunTest": "再テスト",
+      "testing": "テスト中...",
+      "resultTitle": "テスト結果",
+      "probeStatus": "探査状態",
+      "latency": "遅延",
+      "httpCode": "HTTPコード",
+      "subStatus": "詳細状態",
+      "error": "エラー",
+      "responseDetail": "レスポンス詳細",
+      "proofValid": "テスト証明有効（残り {{time}}）",
+      "proofExpired": "テスト証明の期限切れ。再テストしてください",
+      "model": "監視対象モデル",
+      "modelHint": "このチャネルで監視するモデルを選びます。テストと掲載後で同じモデルを使います",
+      "modelVendorUnknown": "一覧にない / 不明",
+      "requestModel": "実際にリクエストするモデル"
+    },
+    "test": {
+      "statusAvailable": "利用可能",
+      "statusDegraded": "低下",
+      "statusUnavailable": "利用不可",
+      "statusUnknown": "不明"
+    },
+    "confirm": {
+      "title": "確認・送信",
+      "description": "以下の情報を確認して申請を送信してください",
+      "sectionProvider": "プロバイダー情報",
+      "sectionConnection": "接続情報",
+      "copy": "コピー",
+      "submit": "申請を送信",
+      "submitting": "送信中...",
+      "successTitle": "申請が送信されました！",
+      "successDescription": "速やかにレビューいたします",
+      "publicId": "申請番号",
+      "publicIdHint": "この番号を保存し、管理者に審査を依頼する際にお伝えください",
+      "contactLabel": "レビュー連絡先",
+      "copyTemplateHint": "連絡テンプレートをコピー：",
+      "contactTemplate": "こんにちは、掲載申請を送信しました（番号：{{id}}、プロバイダー：{{provider}}）。ご確認をお願いします。",
+      "newSubmission": "新規申請",
+      "proofExpiredBanner": "テスト証明の期限切れ。前の手順に戻って再テストしてください",
+      "proofExpiringSoon": "テスト証明の期限が近づいています。早めに送信してください",
+      "agreement": {
+        "title": "入会案内と確認事項",
+        "intro": "本プラットフォームの pulse 等級は無料掲載、ビジネス等級は有料スポンサーです。以下の各項目をお読みのうえチェックし、すべて確認後に送信できます：",
+        "clausePaid": "pulse 等級は無料掲載であり、beacon 等級以上は有料スポンサー(月額前払い、期限内に未更新の場合は pulse へ自動降格、支払済み費用は返金なし)であることを了承します。",
+        "clauseApiKey": "提供する API Key を、設定検証・可用性監視・詳細な品質検査（応答メタデータ、SSE タイミング、キャッシュトークン、モデルフィールド、自己申告 ID などの解析を含み、diag.relaypulse.top を対象とする）および関連表示に利用することに同意します。同意しない場合は入会できません。",
+        "clauseQuality": "チャネルの実際のモデル品質が申告したソースと一致すること（公式と申告する場合は真正な公式 API であること）を保証します。不一致の場合、運営は negative ラベルの付与、掲載停止、コールドボードへの移動を行えます。",
+        "clauseNoCheat": "私は、いかなる形式であっても本プラットフォームの可用性監視または品質検査プローブに対して不正を行わないことを保証します。これには、プローブ応答の偽装やキャッシュ、プローブが期待する回答のエコー、プローブを識別したうえで実ユーザーとは異なる応答を返す行為などが含まれます。事実が確認された場合、プラットフォームは直ちに当該チャネルの掲載を停止し、公開通知を行います。",
+        "clauseLegit": "提供する接続エンドポイント・API Key・ブランド・リンクについて正当な使用権を有し、提出情報が真実かつ正確で、運営が法令に準拠していることを保証します。",
+        "clauseNoEndorse": "スポンサー表示やピン留めは表示・監視特典にすぎず、信用・資金・サービス品質に対する運営の保証ではないことを理解します。運営はコンプライアンスリスクや苦情により一方的に掲載停止できます。",
+        "fullText": "全文はこちら：",
+        "fullLink": "入会案内と確認事項",
+        "allRequiredHint": "すべての項目にチェックしてから送信してください"
+      }
+    }
+  },
+  "contact": {
+    "meta": {
+      "title": "お問い合わせ | Sakrylle Status",
+      "description": "掲載申請、変更リクエスト、フィードバックの送信"
+    },
+    "title": "お問い合わせ",
+    "description": "必要なサービスを選択してください",
+    "apply": {
+      "title": "掲載申請",
+      "description": "新しいAPIサービスをSakrylle Status監視プラットフォームに追加"
+    },
+    "change": {
+      "title": "変更リクエスト",
+      "description": "掲載済みチャネルの設定を変更（URL、APIキーなど）"
+    },
+    "feedback": {
+      "title": "フィードバック",
+      "description": "ご提案、バグ報告、その他のお問い合わせ"
+    },
+    "community": {
+      "title": "コミュニティ",
+      "description": "QQグループに参加して、他のユーザーと交流しましょう"
+    },
+    "discussions": {
+      "title": "ディスカッション",
+      "description": "GitHub Discussionsで質問・共有・議論"
+    }
+  },
+  "changeRequest": {
+    "meta": {
+      "title": "変更リクエスト | Sakrylle Status",
+      "description": "掲載済みチャネルの設定を変更"
+    },
+    "title": "変更リクエスト",
+    "subtitle": "APIキーで本人確認を行い、掲載済みチャネルの設定を変更します",
+    "steps": {
+      "auth": "認証",
+      "edit": "編集",
+      "test": "テスト",
+      "review": "確認"
+    },
+    "back": "戻る",
+    "next": "次へ",
+    "auth": {
+      "title": "本人確認",
+      "description": "掲載済みチャネルのAPIキーを入力してください。システムが対応するチャネルを自動的に検索します。",
+      "placeholder": "APIキーを入力",
+      "submit": "認証",
+      "invalidKey": "有効なAPIキーを入力してください（10文字以上）",
+      "authFailed": "APIキーの認証に失敗しました"
+    },
+    "edit": {
+      "title": "チャネル情報の編集",
+      "description": "チャネル {{channel}} の設定を変更します。空欄の場合は現在の値を維持します。",
+      "selectChannel": "チャネルを選択",
+      "multipleChannels": "APIキーが複数のチャネルに一致しました。変更するチャネルを選択してください。",
+      "current": "現在の値",
+      "noChange": "変更なし",
+      "newApiKeyPlaceholder": "APIキーを変更する場合は新しいキーを入力",
+      "noChanges": "少なくとも1つのフィールドを変更してください",
+      "invalidDisplayName": "表示名に不可視文字が含まれているか、文字数が上限を超えています。修正してください。"
+    },
+    "fields": {
+      "providerName": "プロバイダー名",
+      "providerUrl": "ウェブサイトURL",
+      "channelName": "チャネル名",
+      "category": "カテゴリ",
+      "sponsorLevel": "スポンサーレベル",
+      "baseUrl": "APIベースURL",
+      "newApiKey": "新しいAPIキー"
+    },
+    "test": {
+      "title": "接続テスト",
+      "description": "監視関連のフィールドを変更しました。送信前に接続テストが必要です。",
+      "testType": "サービスタイプ",
+      "variant": "リクエストテンプレート",
+      "run": "テスト実行",
+      "running": "テスト中...",
+      "passed": "テスト合格",
+      "failed": "テスト不合格",
+      "latency": "レイテンシ",
+      "retry": "再テスト",
+      "requestFailed": "テストリクエストに失敗しました",
+      "proofExpired": "テスト証明の期限切れ。再テストしてください"
+    },
+    "review": {
+      "title": "変更の確認",
+      "description": "以下の変更内容を確認して送信してください",
+      "target": "対象チャネル",
+      "submit": "変更を送信",
+      "submitFailed": "送信に失敗しました",
+      "noCheatConfirm": "上記の「監視・品質プローブへの不正禁止」条項を読み、同意します",
+      "noCheatRequired": "base URL または API キーを変更する前に、不正禁止条項を確認してください"
+    },
+    "done": {
+      "title": "変更リクエストが送信されました",
+      "description": "リクエストが送信されました。管理者に連絡する際に必要となるため、以下の番号を保存してください。",
+      "newRequest": "新しいリクエストを送信"
+    }
   },
   "admin": {
     "meta": {
@@ -342,6 +659,9 @@
       "monitors": "チャネル管理",
       "changes": "変更リクエスト"
     },
+    "submissions": {
+      "searchPlaceholder": "申請番号で検索（先頭8文字または完全なUUID）"
+    },
     "monitors": {
       "backToList": "← リストに戻る",
       "parentChannel": "親チャネル",
@@ -350,6 +670,8 @@
       "noChildren": "子チャネルなし",
       "addChild": "子チャネルを追加",
       "removeChild": "削除",
+      "childToggleBlockedByParent": "親チャネルが無効です。モデル単位の切り替えは親を有効化してから反映されます。",
+      "removeChildWarning": "削除（このモデルの監視履歴が永久に失われます。一時停止したい場合は「無効化」を使用）",
       "enable": "有効化",
       "disable": "無効化",
       "show": "表示",
@@ -359,7 +681,10 @@
       "copyKey": "API Key をコピー",
       "copiedKey": "コピーしました",
       "probe": "プローブ",
+      "probeResponseBody": "レスポンス本文",
       "probing": "プローブ中...",
+      "probeTargetPending": "対象チャンネルの設定はまだ有効ではありません。保存してホットリロード後に再試行してください。",
+      "viaProxy": "プロキシ経由",
       "templateDirtyHint": "テンプレート変更を保存してからテストしてください（base_url / api_key はその場で上書き可）",
       "tabs": {
         "detail": "詳細",
@@ -391,7 +716,7 @@
       "confirmArchive": "アーカイブしますか？",
       "confirmYes": "確認",
       "create": "新規モニター",
-      "searchPlaceholder": "プロバイダー / サービス / チャネルを検索...",
+      "searchPlaceholder": "プロバイダー / チャネル / モデル / ドメインで検索（スペース区切りで複数語）...",
       "allBoards": "すべてのボード",
       "allStatus": "すべてのステータス",
       "statusActive": "アクティブ",
@@ -448,6 +773,8 @@
         "sponsorLevel": "スポンサーレベル",
         "keyType": "キータイプ",
         "board": "ボード",
+        "coldReason": "コールド理由",
+        "coldReasonPlaceholder": "例：長期間利用不可（一般公開されます）",
         "interval": "間隔",
         "model": "モデル",
         "apiKey": "APIキー",
@@ -459,7 +786,8 @@
         "autoColdExempt": "自動コールドボード除外",
         "autoColdExemptHint": "このチャネルの自動コールドボード移動をクリアし、以後ブロックします",
         "autoMoveExempt": "自動移動除外",
-        "autoMoveExemptHint": "可用率に基づく自動移動を全てスキップします（有効期限による降格は対象外）"
+        "autoMoveExemptHint": "可用率に基づく自動移動を全てスキップします（有効期限による降格は対象外）",
+        "modelVendor": "モデル提供元"
       },
       "form": {
         "title": "新規モニター作成",
@@ -468,7 +796,8 @@
         "attributes": "属性",
         "childChannels": "子チャネル（マルチモデル）",
         "childHint": "同一PSCで複数モデルを監視する場合、子チャネルを追加します。親の設定を継承します。",
-        "modelPlaceholder": "空欄の場合テンプレートのデフォルト値を使用",
+        "modelPlaceholder": "空欄でテンプレートに従う（変更すると履歴が分断）",
+        "modelKeyWarning": "注意：「モデル」はこの行の履歴系列のビジネスキーであり、上流に送信するモデル ID ではありません。空欄にするとテンプレートに従います。入力・変更するとこの行の既存の履歴が分断されます。",
         "requiredFields": "プロバイダー、サービス、チャネルは必須です",
         "create": "作成"
       }
@@ -493,7 +822,31 @@
       "delete": "削除",
       "confirmDelete": "この変更リクエストを削除しますか？",
       "proposedChanges": "変更内容",
+      "adminEdit": "管理者による編集",
+      "readOnly": "読み取り専用",
       "currentSnapshot": "現在のスナップショット",
+      "liveUnavailable": {
+        "manual": "チャネルは手動モードです。提出時のスナップショットを表示します",
+        "deleted": "チャネルが存在しません。提出時のスナップショットを表示します",
+        "error": "現在の設定を読み取れませんでした。提出時のスナップショットを表示します"
+      },
+      "editElsewhereHint": "他のチャネルフィールドを変更するには、チャネル管理へ移動してください",
+      "colField": "項目",
+      "colCurrent": "現在",
+      "colProposed": "変更後",
+      "fields": {
+        "provider_name": "プロバイダー名",
+        "provider_url": "ウェブサイトURL",
+        "website_url": "ウェブサイトURL",
+        "channel_name": "チャネル名",
+        "category": "カテゴリ",
+        "sponsor_level": "スポンサーレベル",
+        "listed_since": "収録日",
+        "expires_at": "有効期限",
+        "price_min": "最低価格",
+        "price_max": "最高価格",
+        "base_url": "APIベースURL"
+      },
       "testInfo": "テスト情報",
       "testType": "サービスタイプ",
       "testVariant": "リクエストテンプレート",
@@ -504,7 +857,10 @@
       "adminNote": "管理者メモ",
       "adminNotePlaceholder": "メモを入力...",
       "rejectNotePlaceholder": "却下理由を入力...",
-      "confirmReject": "却下を確認"
+      "confirmReject": "却下を確認",
+      "antiCheatNA": "不正禁止条項：対象外（監視関連項目の変更なし）",
+      "antiCheatConfirmed": "不正禁止条項：確認済み",
+      "antiCheatMissing": "不正禁止条項：未確認"
     },
     "detail": {
       "back": "リストに戻る",
@@ -526,7 +882,17 @@
       "sponsorLevel": "スポンサーレベル",
       "channelType": "チャネルタイプ",
       "channelSource": "チャネルソース",
+      "channelGroup": "チャネルグループコード",
       "channelName": "チャネル表示名",
+      "expiresAt": "有効期限",
+      "targetProvider": "Provider 上書き",
+      "targetProviderHint": "英数字コード。空欄ならサービス名から派生",
+      "targetService": "Service 上書き",
+      "targetServiceHint": "英数字コード。空欄で派生値を使用",
+      "targetChannel": "Channel 上書き",
+      "targetChannelHint": "英数字コード。空欄で派生値を使用",
+      "suggestedChannel": "推奨",
+      "pscOverrideInvalid": "ここは表示名ではなく URL 用のコードです：小文字・数字・ハイフンのみ、先頭と末尾のハイフンおよび連続ハイフンは不可、100文字以内",
       "listedSince": "掲載開始日",
       "priceMin": "最低価格倍率",
       "priceMax": "最高価格倍率",
@@ -548,13 +914,46 @@
       "testing": "テスト中...",
       "testResult": "テスト結果",
       "subStatus": "詳細ステータス",
+      "testCurl": "リクエスト curl",
+      "testCurlCopy": "コピー",
+      "testCurlCopyWithKey": "鍵込みでコピー",
+      "testCurlKeyHint": "既定では実鍵を $RP_API_KEY で伏せており、安全に共有できます。「鍵込みでコピー」で実鍵を埋め込み、そのまま実行可能なコマンドを生成します。",
       "publish": "公開",
       "reject": "却下",
       "rejectNotePlaceholder": "却下理由を入力...",
       "confirmReject": "却下を確認",
       "delete": "削除",
       "confirmDelete": "削除を確認",
-      "cancel": "キャンセル"
+      "cancel": "キャンセル",
+      "model": "行レベルのモデル ID",
+      "modelVendor": "モデル提供元"
     }
+  },
+  "vendors": {
+    "anthropic": "Anthropic",
+    "openai": "OpenAI",
+    "google": "Google",
+    "bytedance": "ByteDance",
+    "zhipu": "智譜AI",
+    "moonshot": "Moonshot AI",
+    "minimax": "MiniMax",
+    "deepseek": "DeepSeek",
+    "qwen": "Qwen",
+    "grok": "Grok",
+    "agnes": "Agnes"
+  },
+  "modelFamilies": {
+    "opus": "Opus",
+    "sonnet": "Sonnet",
+    "haiku": "Haiku",
+    "fable": "Fable",
+    "gpt": "GPT",
+    "gemini": "Gemini",
+    "deepseek": "DeepSeek",
+    "doubao": "Doubao",
+    "glm": "GLM",
+    "kimi": "Kimi",
+    "minimax": "MiniMax",
+    "other": "その他"
   }
 }

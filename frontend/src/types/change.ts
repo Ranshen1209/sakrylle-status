@@ -46,21 +46,12 @@ export interface SubmitChangeRequest {
   test_latency?: number;
   test_http_code?: number;
   locale?: string;
+  agreement_accepted?: boolean;
 }
 
 /** 提交变更响应 */
 export interface SubmitChangeResponse {
   public_id: string;
-}
-
-/** 变更请求状态查询响应 */
-export interface ChangeStatusResponse {
-  public_id: string;
-  status: ChangeRequestStatus;
-  target_key: string;
-  apply_mode: string;
-  created_at: number;
-  updated_at: number;
 }
 
 /** 管理端变更请求 */
@@ -87,22 +78,29 @@ export interface AdminChangeRequest {
   test_passed_at?: number;
   test_latency_ms?: number;
   test_http_code?: number;
+  /** 通道实时当前值（仅 proposed 涉及字段；后端 AdminList 填充）。manual/已删/读失败时缺省。 */
+  live_current?: Record<string, string>;
+  live_current_source?: 'auto' | 'manual' | 'deleted' | 'error';
   admin_note?: string;
   reviewed_at?: number;
   applied_at?: number;
   submitter_ip_hash?: string;
   locale?: string;
+  agreement_accepted?: boolean;
+  agreement_accepted_at?: number;
+  agreement_version?: string;
   created_at: number;
   updated_at: number;
 }
 
-/** 允许用户变更的字段集合（API Key 轮换使用顶层 new_api_key 字段，不走 proposed_changes） */
+/**
+ * 允许用户自助变更的字段集合（API Key 轮换使用顶层 new_api_key 字段，不走 proposed_changes）。
+ * 注意：类别（category）与赞助等级（sponsor_level）须经 QQ 人工对接，不属于自助变更范围（见 sponsorship.md §2.2）。
+ */
 export const EDITABLE_FIELDS = [
   'provider_name',
   'provider_url',
   'channel_name',
-  'category',
-  'sponsor_level',
   'base_url',
 ] as const;
 

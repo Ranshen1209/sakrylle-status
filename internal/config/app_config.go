@@ -2,6 +2,22 @@ package config
 
 import "time"
 
+// ServerConfig 描述 HTTP 入口如何判定"真实客户端 IP"。
+//
+// 该判定是所有按 IP 计数的防护（探测限流、收录/变更每日配额、submitter_ip_hash 审计）
+// 的唯一信任根：判错则三者同时失效。默认值刻意收紧到"只信本机回环代理"，
+// 且不预设任何厂商专有 Header——自托管者不在 CDN 后面时开箱即安全。
+type ServerConfig struct {
+	// TrustedPlatform 是由可信入口覆写、不可被客户端伪造的客户端 IP Header
+	// （如 Cloudflare 的 CF-Connecting-IP）。非空时 gin 直接采信该 Header 并跳过
+	// X-Forwarded-For 链解析，因此**仅当应用端口不可被绕过入口直连时**才可设置。
+	TrustedPlatform string `yaml:"trusted_platform" json:"trusted_platform"`
+
+	// TrustedProxies 是允许提供 X-Forwarded-For / X-Real-IP 的代理地址（IP 或 CIDR）。
+	// 留空则回落到 defaultTrustedProxies（仅回环）。
+	TrustedProxies []string `yaml:"trusted_proxies" json:"trusted_proxies"`
+}
+
 // AppConfig 应用配置
 type AppConfig struct {
 	// ===== 探测时间配置 =====
@@ -99,6 +115,9 @@ type AppConfig struct {
 	// 存储配置
 	Storage StorageConfig `yaml:"storage" json:"storage"`
 
+	// HTTP 入口的可信代理边界（决定 c.ClientIP() 取值，进而决定限流与配额的计数主体）
+	Server ServerConfig `yaml:"server" json:"server"`
+
 	// 公开访问的基础 URL（用于 SEO、sitemap 等）
 	// 默认: https://relaypulse.top
 	// 可通过环境变量 MONITOR_PUBLIC_BASE_URL 覆盖
@@ -120,6 +139,32 @@ type AppConfig struct {
 	HiddenProviders []hiddenProviderConfig `yaml:"hidden_providers" json:"hidden_providers"`
 
 	// ===== 功能开关 =====
+
+	// 是否在公开列表/卡片中隐藏价格列。默认 false（显示价格列）。
+	// 运行时配置：改 yaml 即触发热更新，前端通过 /api/status meta 拿到新值，
+	// 不需要重建镜像或重启容器。
+	HidePriceColumn bool `yaml:"hide_price_column" json:"hide_price_column"`
+
+	// 是否在公开列表中隐藏「画作」列（rpdiag 最近几次测试的鹈鹕画）。默认 false（显示）。
+	// 运行时配置，同 hide_price_column；未接 rpdiag 时该列本来就不出。
+	HideDrawingColumn bool `yaml:"hide_drawing_column" json:"hide_drawing_column"`
+
+	// 是否在公开列表中隐藏「分类」筛选器（公益站/商业站）。默认 false（显示）。
+	// 运行时配置：改 yaml 即触发热更新，前端通过 /api/status meta 拿到新值，
+	// 不需要重建镜像或重启容器。
+	// 注意这里隐藏的只是筛选入口，category 字段本身仍照常下发。
+	// 开关打开时，前端把 URL 里残留的 ?category= 视为未选中（不再过滤数据），
+	// 但**不删除该参数**——关掉开关后用户原来的选择自动恢复。
+	HideCategoryFilter bool `yaml:"hide_category_filter" json:"hide_category_filter"`
+
+	// 是否在公开列表中隐藏「模型厂商」筛选器。默认 false（显示）。
+	// 运行时配置：改 yaml 即触发热更新，前端通过 /api/status meta 拿到新值，
+	// 不需要重建镜像或重启容器。
+	// 与 HideCategoryFilter 同款语义：隐藏的只是筛选入口——model_vendor 字段照常
+	// 下发、**模型名前的厂商图标不受影响**（图标是观察维度，筛选器是操作轴，绑死了以后想单独
+	// 调就难拆）。开关打开时前端把 URL 里残留的 ?vendor= 视为未选中（不再过滤
+	// 数据），但**不删除该参数**——关掉开关后用户原来的选择自动恢复。
+	HideVendorFilter bool `yaml:"hide_vendor_filter" json:"hide_vendor_filter"`
 
 	// 热板/冷板功能配置（默认禁用，保持向后兼容）
 	// 启用后可通过 monitor.board 字段控制监测项归属

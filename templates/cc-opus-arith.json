@@ -1,6 +1,8 @@
 {
+	"self_serve_label": "Claude Opus 4.7",
 	"model": "Opus",
 	"request_model": "claude-opus-4-7",
+	"model_vendor": "anthropic",
 	"url": "{{BASE_URL}}/v1/messages",
 	"method": "POST",
 	"headers": {
@@ -33,8 +35,8 @@
 		"success_contains": "{{EXPECTED_ANSWER}}"
 	},
 	"probe": {
-		"slow_latency": "5s",
-		"timeout": "10s",
+		"slow_latency": "8s",
+		"timeout": "15s",
 		"retry": 0
 	}
 }

@@ -1,6 +1,8 @@
 {
+	"self_serve_label": "Gemini 2.5 Flash Thinking",
 	"model": "Flash Thinking",
 	"request_model": "gemini-2.5-flash-thinking",
+	"model_vendor": "google",
 	"url": "{{BASE_URL}}/v1beta/models/{{MODEL}}:generateContent",
 	"method": "POST",
 	"headers": {

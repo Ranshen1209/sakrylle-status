@@ -15,13 +15,16 @@ import (
 
 // Watcher 配置文件监听器
 type Watcher struct {
-	loader       *Loader
-	filename     string
-	watcher      *fsnotify.Watcher
-	onReload     func(*AppConfig)
-	debounceTime time.Duration
-	watchMu      sync.Mutex
-	watchedDirs  map[string]struct{}
+	loader   *Loader
+	filename string
+	watcher  *fsnotify.Watcher
+	onReload func(*AppConfig)
+	// onReloadError 在配置加载/校验失败、保留旧配置时被调用（可为 nil）。
+	// 只在 Start 之前由 SetOnReloadError 写入，之后仅由 reload goroutine 读，故无需加锁。
+	onReloadError func(error)
+	debounceTime  time.Duration
+	watchMu       sync.Mutex
+	watchedDirs   map[string]struct{}
 }
 
 // NewWatcher 创建配置监听器
@@ -38,6 +41,14 @@ func NewWatcher(loader *Loader, filename string, onReload func(*AppConfig)) (*Wa
 		onReload:     onReload,
 		debounceTime: 200 * time.Millisecond, // 防抖延迟
 	}, nil
+}
+
+// SetOnReloadError 注册配置热更新失败回调（保留旧配置那条路径）。
+// 必须在 Start 之前调用；传 nil 表示不接收失败通知。
+// 与 onReload 分开而不是塞进构造函数：失败通知是可选的运维观测面，
+// 私有部署不接也应照常工作。
+func (w *Watcher) SetOnReloadError(callback func(error)) {
+	w.onReloadError = callback
 }
 
 // Start 启动监听（监听父目录以兼容不同编辑器）
@@ -93,7 +104,15 @@ func (w *Watcher) Start(ctx context.Context) error {
 				isMonitorDFile := strings.HasPrefix(eventPath, monitorsDirPrefix) &&
 					isMonitorDefinitionFile(filepath.Base(eventPath))
 
-				if !isConfigFile && !isTemplateFile && !isMonitorsDirSelf && !isMonitorDFile {
+				// 泄露 Key 拒绝名单就在已监听的主配置目录里，但它不是 config.yaml 也不是模板，
+				// 不在此显式放行的话，单独更新名单永远不会触发热更新（名单改了却不生效）。
+				// 按**当前生效配置**引用的文件名判定，而不是目录内任意文件，避免无关文件变更
+				// 触发整份配置重载；配置里改了名单文件名时，config.yaml 自身的变更会先触发一次
+				// 重载，之后这里读到的就是新名字。
+				isRevokedKeyFile := eventPath == w.currentRevokedKeyPath(dir)
+
+				if !isConfigFile && !isTemplateFile && !isRevokedKeyFile &&
+					!isMonitorsDirSelf && !isMonitorDFile {
 					continue
 				}
 
@@ -146,6 +165,11 @@ func (w *Watcher) reload() {
 	newConfig, err := w.loader.loadOrRollback(w.filename)
 	if err != nil {
 		logger.Error("config", "重载失败", "error", err)
+		// 这条路径此前只有日志：磁盘配置坏掉后运行态靠旧配置续命、admin 写入返回 200，
+		// 却没有任何健康端点体现，只能靠人翻日志发现。通知调用方以便信息化暴露。
+		if w.onReloadError != nil {
+			w.onReloadError(err)
+		}
 		return
 	}
 
@@ -207,4 +231,22 @@ func (w *Watcher) rewatchPath(path string) error {
 		return nil
 	}
 	return w.addWatch(filepath.Dir(path))
+}
+
+// currentRevokedKeyPath 返回**当前生效配置**引用的泄露 Key 拒绝名单绝对路径。
+// 未配置、配置非法或尚无生效配置时返回空字符串——调用方用 `eventPath == ""` 判不成立，
+// 因此不会误放行任何事件（filepath.Clean 后的事件路径不可能是空串）。
+func (w *Watcher) currentRevokedKeyPath(configDir string) string {
+	if w.loader == nil {
+		return ""
+	}
+	cfg := w.loader.getCurrent()
+	if cfg == nil {
+		return ""
+	}
+	path, err := resolveRevokedKeyFilePath(configDir, cfg.ChangeRequests.RevokedKeyFile)
+	if err != nil || path == "" {
+		return ""
+	}
+	return filepath.Clean(path)
 }
