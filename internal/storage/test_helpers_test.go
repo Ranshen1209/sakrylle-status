@@ -23,13 +23,31 @@ func (panicStorage) GetHistory(string, string, string, string, time.Time) ([]*Pr
 func (panicStorage) GetHistoryWithLimit(string, string, string, string, time.Time, int) ([]*ProbeRecord, error) {
 	panic("not implemented")
 }
+func (panicStorage) GetLatestByModelID(string) (*ProbeRecord, error) {
+	panic("not implemented")
+}
+func (panicStorage) GetHistoryByModelID(string, time.Time) ([]*ProbeRecord, error) {
+	panic("not implemented")
+}
+func (panicStorage) GetHistoryWithLimitByModelID(string, time.Time, int) ([]*ProbeRecord, error) {
+	panic("not implemented")
+}
 func (panicStorage) GetLatestBatch([]MonitorKey) (map[MonitorKey]*ProbeRecord, error) {
 	panic("not implemented")
 }
 func (panicStorage) GetHistoryBatch([]MonitorKey, time.Time) (map[MonitorKey][]*ProbeRecord, error) {
 	panic("not implemented")
 }
+func (panicStorage) GetLatestBatchByModelID([]ProbeHistoryKey) (map[ProbeHistoryKey]*ProbeRecord, error) {
+	panic("not implemented")
+}
+func (panicStorage) GetHistoryBatchByModelID([]ProbeHistoryKey, time.Time) (map[ProbeHistoryKey][]*ProbeRecord, error) {
+	panic("not implemented")
+}
 func (panicStorage) MigrateChannelData([]ChannelMigrationMapping) error { panic("not implemented") }
+func (panicStorage) BackfillProbeHistoryModelIDs([]ModelIDMigrationMapping) error {
+	panic("not implemented")
+}
 func (panicStorage) GetServiceState(string, string, string, string) (*ServiceState, error) {
 	panic("not implemented")
 }

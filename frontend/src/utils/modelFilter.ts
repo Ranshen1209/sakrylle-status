@@ -1,0 +1,182 @@
+import { shortenModelName } from './modelName';
+import { MODEL_FAMILIES, MODEL_FAMILY_OTHER, deriveModelFamily } from './modelFamily';
+
+/** 家族在声明表里的位置；未知家族排在最后。排序比较器里高频调用，故建表查而非线性扫。 */
+const FAMILY_RANK = new Map(MODEL_FAMILIES.map((entry, index) => [entry.code, index]));
+function familyRank(family: string): number {
+  return FAMILY_RANK.get(family) ?? MODEL_FAMILIES.length;
+}
+
+/** 与 ProcessedMonitorData.modelEntries 兼容的最小形状。 */
+export interface ModelEntryLike {
+  model?: string;
+  requestModel?: string;
+}
+
+/** 一个模型在筛选器里的身份：key 用于比较，label 用于展示，family 用于分组。 */
+export interface ModelFilterOption {
+  key: string;
+  label: string;
+  family: string;
+}
+
+/**
+ * 模型的展示名。**表格「模型」列与「模型」筛选器共用这一个派生**——两处各算各的，
+ * 用户就会在下拉里看到表格中根本不存在的名字，「所见即所筛」随即失效。
+ * `components/table/modelNames.ts` 反过来调用本函数，那里不再有第二份表达式。
+ *
+ * `request_model` 优先：它是探针实际发出的模型 ID；`model` 只是展示名，且常是
+ * 跨版本的家族抽象（`Opus` 底下同时躺着 4.6/4.7/4.8/5）。
+ */
+export function modelDisplayName(entry: ModelEntryLike): string {
+  return shortenModelName(entry.requestModel ?? '') || entry.model || '-';
+}
+
+/** 比较用的 canonical key：trim + 小写折叠。 */
+export function modelFilterKey(displayName: string): string {
+  return displayName.trim().toLowerCase();
+}
+
+/**
+ * 同一 canonical key 被多条 layer 派生出来时，取哪一个当选项的元数据。
+ *
+ * 必须**完全不依赖遍历顺序**，否则同一个选项会随后端返回顺序变脸。两处会分歧：
+ *
+ *   1. label 写法不同（`Haiku` vs `haiku`）——取字典序小的。任意但稳定，且恰好
+ *      偏向首字母大写的规范写法（大写字母码位更小）。
+ *   2. **label 相同但 family 不同**——真实可触发：`{model:'Flash',
+ *      requestModel:'gemini-2.5-flash'}` 与行级写死的 `{model:'2.5-flash',
+ *      requestModel:''}` 会得到同一个 label `2.5-flash`，前者归 gemini、后者
+ *      因为 key 里没有厂商前缀只能归 other。此时**永远取信息量更大的那个**：
+ *      非 other 优先；都非 other 时按家族表顺序取靠前的。
+ *      少了这一条，那个选项会随数据顺序在 Gemini 组和「其他」组之间跳。
+ */
+export function preferredModelOption(a: ModelFilterOption, b: ModelFilterOption): ModelFilterOption {
+  if (a.family !== b.family) {
+    if (a.family === MODEL_FAMILY_OTHER) return b;
+    if (b.family === MODEL_FAMILY_OTHER) return a;
+    return familyRank(a.family) <= familyRank(b.family) ? a : b;
+  }
+  return a.label <= b.label ? a : b;
+}
+
+/**
+ * 派生一个通道的模型筛选身份，**通道内按 key 去重**（同一通道挂两个同模型的
+ * layer 仍只是一个选项、也只算一次命中）。
+ *
+ * 顺序保持输入顺序——展示顺序是 useFilterOptions 的事，工具层不替它做决定。
+ */
+export function collectModelOptions(entries?: readonly ModelEntryLike[]): ModelFilterOption[] {
+  const seen = new Set<string>();
+  const options: ModelFilterOption[] = [];
+
+  for (const entry of entries ?? []) {
+    const requestModel = entry.requestModel ?? '';
+    const model = entry.model ?? '';
+    // 两者皆空的占位条目在表格里显示 "-"，它不是一个可筛选的模型。
+    if (!requestModel.trim() && !model.trim()) continue;
+
+    const label = modelDisplayName(entry);
+    const key = modelFilterKey(label);
+    if (!key || seen.has(key)) continue;
+
+    seen.add(key);
+    options.push({ key, label, family: deriveModelFamily(requestModel, model) });
+  }
+  return options;
+}
+
+/**
+ * 模型筛选的匹配谓词：**any（通道级）语义**——通道只要有任一 layer 命中所选
+ * 模型之一，整条通道就保留。
+ *
+ * 厂商筛选同样采用通道级 any 语义，均保留整条通道的全部模型层。
+ *
+ * 未声明任何模型的通道在筛选生效时排除——与 vendor 口径一致，「未知」不属于
+ * 任何一个具体选项。
+ */
+export function matchesModelKeys(
+  entries: readonly ModelEntryLike[] | undefined,
+  selectedKeys: ReadonlySet<string>,
+): boolean {
+  if (selectedKeys.size === 0) return true;
+  return collectModelOptions(entries).some((option) => selectedKeys.has(option.key));
+}
+
+/** 下拉里的一个模型选项（MultiSelectOption 的结构，utils 层不依赖组件类型）。 */
+export interface ModelFilterOptionView {
+  value: string;
+  label: string;
+  groupKey: string;
+  groupLabel: string;
+}
+
+interface BuildModelOptionsParams {
+  /** 已按**其它**维度联动过滤的数据，决定每个选项的计数与是否出现。 */
+  scoped: readonly { modelEntries?: readonly ModelEntryLike[] }[];
+  /** **未经任何筛选器过滤**的数据，只用来定 label 与 family（理由见下）。 */
+  all: readonly { modelEntries?: readonly ModelEntryLike[] }[];
+  /** 当前已选的 canonical key。 */
+  selected: readonly string[];
+  /** 家族 code → 本地化组标题。 */
+  familyLabel: (code: string) => string;
+}
+
+/**
+ * 构建「模型」筛选器的下拉选项。首页与服务商页共用这一份——两页的筛选链路本就是
+ * 各写一套的平行实现，模型这根轴不能再复制第三份。
+ *
+ * 三条不能省的规矩：
+ *   ① label/family 取自 `all` 而非 `scoped`。已选项被联动条件排除后仍要标 `(0)`
+ *      保留可见，此时它已不在 scoped 里；Gemini 尤其明显——展示名被剥了厂商前缀
+ *      （gemini-2.5-flash → 2.5-flash），从 key 反推不出家族，只有全量映射知道。
+ *   ② 计数口径是「含该模型的**通道**数」（collectModelOptions 已在通道内去重）。
+ *      模型是通道内的多值属性，各选项计数之和会大于通道总数，这与「选它能看到
+ *      几行」一致。
+ *   ③ 输出**按家族分段连续**。MultiSelect 按数组里首次出现的顺序聚合分组，
+ *      同家族选项被打散就会分裂出多个重名组。
+ */
+export function buildModelOptions({
+  scoped,
+  all,
+  selected,
+  familyLabel,
+}: BuildModelOptionsParams): ModelFilterOptionView[] {
+  const metadata = new Map<string, ModelFilterOption>();
+  for (const item of all) {
+    for (const option of collectModelOptions(item.modelEntries)) {
+      const existing = metadata.get(option.key);
+      metadata.set(option.key, existing ? preferredModelOption(option, existing) : option);
+    }
+  }
+
+  const counts = new Map<string, number>();
+  for (const item of scoped) {
+    for (const option of collectModelOptions(item.modelEntries)) {
+      counts.set(option.key, (counts.get(option.key) ?? 0) + 1);
+    }
+  }
+
+  const selectedSet = new Set(selected);
+  selectedSet.forEach((key) => {
+    if (!counts.has(key)) counts.set(key, 0);
+  });
+
+  return Array.from(counts.entries())
+    .map(([key, count]) => {
+      // 全量里也没有的 key（用户手改 URL）只能就 key 本身尽力归族。
+      const meta = metadata.get(key) ?? { key, label: key, family: deriveModelFamily('', key) };
+      return { ...meta, count };
+    })
+    .sort((a, b) => {
+      const byFamily = familyRank(a.family) - familyRank(b.family);
+      if (byFamily !== 0) return byFamily;
+      return a.label.localeCompare(b.label, 'zh-CN');
+    })
+    .map(({ key, label, family, count }) => ({
+      value: key,
+      label: count === 0 && selectedSet.has(key) ? `${label} (0)` : label,
+      groupKey: family,
+      groupLabel: familyLabel(family),
+    }));
+}

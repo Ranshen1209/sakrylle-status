@@ -19,37 +19,63 @@ type StatusPoint struct {
 
 // MonitorLayer 监测层（单个 model 的探测结果）
 type MonitorLayer struct {
-	Model         string              `json:"model"`
-	RequestModel  string              `json:"request_model"` // 实际请求模型 ID（优先 request_model，回退 model）
-	LayerOrder    int                 `json:"layer_order"`   // 0=父，1+=子（按配置顺序）
+	Model        string `json:"model"`
+	RequestModel string `json:"request_model"` // 实际请求模型 ID（优先 request_model，回退 model）
+	// ModelVendor 模型厂商受控 code（词表见 internal/modelvendor），标识「这一层跑的是谁家的模型」。
+	// 存量行全为空 → omitempty 使其完全不出现在 wire 上，对既有消费者是逐字节 additive。
+	ModelVendor   string              `json:"model_vendor,omitempty"`
+	LayerOrder    int                 `json:"layer_order"` // 0=父，1+=子（按配置顺序）
 	CurrentStatus StatusPoint         `json:"current_status"`
 	Timeline      []storage.TimePoint `json:"timeline"`
 }
 
+// layerData 承载单层的当前状态与时间线，是构建 MonitorLayer 的数据侧输入。
+type layerData struct {
+	current  StatusPoint
+	timeline []storage.TimePoint
+}
+
+// newMonitorLayer 由监测行配置与其数据构建一个输出层，父层与子层共用。
+// 刻意收敛成单一构造点：此前父/子两处各写一份字面量，每加一个字段就要改两处、
+// 漏一处便是「子层缺字段」这类只在多模型通道上才现形的 bug。
+func newMonitorLayer(cfg config.ServiceConfig, layerOrder int, data layerData) MonitorLayer {
+	return MonitorLayer{
+		Model:         cfg.Model,
+		RequestModel:  resolvedRequestModel(cfg),
+		ModelVendor:   cfg.ModelVendor,
+		LayerOrder:    layerOrder,
+		CurrentStatus: data.current,
+		Timeline:      data.timeline,
+	}
+}
+
 // MonitorGroup 监测组（父子/多模型结构的聚合单元）
 type MonitorGroup struct {
-	Provider      string              `json:"provider"`
-	ProviderName  string              `json:"provider_name,omitempty"`
-	ProviderSlug  string              `json:"provider_slug"`
-	ProviderURL   string              `json:"provider_url"`
-	Service       string              `json:"service"`
-	ServiceName   string              `json:"service_name,omitempty"`
-	Category      string              `json:"category"`
-	Sponsor       string              `json:"sponsor"`
-	SponsorURL    string              `json:"sponsor_url"`
-	SponsorLevel  config.SponsorLevel `json:"sponsor_level,omitempty"`
-	Annotations   []config.Annotation `json:"annotations,omitempty"`
-	PriceMin      *float64            `json:"price_min,omitempty"`
-	PriceMax      *float64            `json:"price_max,omitempty"`
-	ListedDays    *int                `json:"listed_days,omitempty"`
-	Channel       string              `json:"channel"`
-	ChannelName   string              `json:"channel_name,omitempty"`
-	Board         string              `json:"board"`
-	ColdReason    string              `json:"cold_reason,omitempty"`
-	ProbeURL      string              `json:"probe_url,omitempty"`
-	TemplateName  string              `json:"template_name,omitempty"`
-	IntervalMs    int64               `json:"interval_ms"`
-	SlowLatencyMs int64               `json:"slow_latency_ms"`
+	Provider          string              `json:"provider"`
+	ProviderName      string              `json:"provider_name,omitempty"`
+	ProviderSlug      string              `json:"provider_slug"`
+	ProviderURL       string              `json:"provider_url"`
+	Service           string              `json:"service"`
+	ServiceName       string              `json:"service_name,omitempty"`
+	Category          string              `json:"category"`
+	Sponsor           string              `json:"sponsor"`
+	SponsorURL        string              `json:"sponsor_url"`
+	SponsorLevel      config.SponsorLevel `json:"sponsor_level,omitempty"`
+	Annotations       []config.Annotation `json:"annotations,omitempty"`
+	PriceMin          *float64            `json:"price_min,omitempty"`
+	PriceMax          *float64            `json:"price_max,omitempty"`
+	ListedDays        *int                `json:"listed_days,omitempty"`
+	Channel           string              `json:"channel"`
+	ChannelID         string              `json:"channel_id,omitempty"` // 通道稳定 id（跨产品 join 锚，运行时注入，组级；旧后端缺失）
+	ChannelName       string              `json:"channel_name,omitempty"`
+	Board             string              `json:"board"`
+	ColdReason        string              `json:"cold_reason,omitempty"`
+	BoardReason       string              `json:"board_reason,omitempty"`        // 移板机器码（如 "quality_hardfail"），前端本地化
+	BoardReasonModels string              `json:"board_reason_models,omitempty"` // 触发质量移板的模型名（逗号连接）
+	ProbeURL          string              `json:"probe_url,omitempty"`
+	TemplateName      string              `json:"template_name,omitempty"`
+	IntervalMs        int64               `json:"interval_ms"`
+	SlowLatencyMs     int64               `json:"slow_latency_ms"`
 
 	CurrentStatus int            `json:"current_status"` // 组级最差状态：0>2>1>-1
 	Layers        []MonitorLayer `json:"layers"`
@@ -149,17 +175,8 @@ func buildMonitorGroupFromParent(parent config.ServiceConfig, enableAnnotations 
 		slug = strings.ToLower(strings.TrimSpace(parent.Provider))
 	}
 
-	// 计算收录天数（从 listed_since 到今天）
-	var listedDays *int
-	if parent.ListedSince != "" {
-		if listedDate, err := time.Parse("2006-01-02", parent.ListedSince); err == nil {
-			days := int(time.Since(listedDate).Hours() / 24)
-			if days < 0 {
-				days = 0 // 防止未来日期导致负数
-			}
-			listedDays = &days
-		}
-	}
+	// 计算收录天数（从 listed_since 到今天，按 CST 业务日历日计算，见 listed_days.go）
+	listedDays := listedDaysSince(parent.ListedSince, time.Now().UTC())
 
 	// enable_annotations 仅控制 annotations[] 是否输出（与 buildMonitorResult 一致）
 	annotations := parent.Annotations
@@ -175,30 +192,33 @@ func buildMonitorGroupFromParent(parent config.ServiceConfig, enableAnnotations 
 	}
 
 	return MonitorGroup{
-		Provider:      parent.Provider,
-		ProviderName:  parent.ProviderName,
-		ProviderSlug:  slug,
-		ProviderURL:   parent.ProviderURL,
-		Service:       parent.Service,
-		ServiceName:   parent.ServiceName,
-		Category:      parent.Category,
-		Sponsor:       parent.Sponsor,
-		SponsorURL:    parent.SponsorURL,
-		SponsorLevel:  parent.SponsorLevel,
-		Annotations:   annotations,
-		PriceMin:      parent.PriceMin,
-		PriceMax:      parent.PriceMax,
-		ListedDays:    listedDays,
-		Channel:       parent.Channel,
-		ChannelName:   parent.ChannelName,
-		Board:         parent.Board,
-		ColdReason:    parent.ColdReason,
-		ProbeURL:      probeURL,
-		TemplateName:  templateName,
-		IntervalMs:    parent.IntervalDuration.Milliseconds(),
-		SlowLatencyMs: parent.SlowLatencyDuration.Milliseconds(),
-		CurrentStatus: -1,
-		Layers:        make([]MonitorLayer, 0),
+		Provider:          parent.Provider,
+		ProviderName:      parent.ProviderName,
+		ProviderSlug:      slug,
+		ProviderURL:       parent.ProviderURL,
+		Service:           parent.Service,
+		ServiceName:       parent.ServiceName,
+		Category:          parent.Category,
+		Sponsor:           parent.Sponsor,
+		SponsorURL:        parent.SponsorURL,
+		SponsorLevel:      parent.SponsorLevel,
+		Annotations:       annotations,
+		PriceMin:          parent.PriceMin,
+		PriceMax:          parent.PriceMax,
+		ListedDays:        listedDays,
+		Channel:           parent.Channel,
+		ChannelID:         parent.ChannelID,
+		ChannelName:       parent.ChannelName,
+		Board:             parent.Board,
+		ColdReason:        parent.ColdReason,
+		BoardReason:       parent.BoardReason,
+		BoardReasonModels: parent.BoardReasonModels,
+		ProbeURL:          probeURL,
+		TemplateName:      templateName,
+		IntervalMs:        parent.IntervalDuration.Milliseconds(),
+		SlowLatencyMs:     parent.SlowLatencyDuration.Milliseconds(),
+		CurrentStatus:     -1,
+		Layers:            make([]MonitorLayer, 0),
 	}
 }
 
@@ -257,11 +277,6 @@ func (h *Handler) buildMonitorGroups(
 	}
 
 	// 构建 layerByKey 索引
-	type layerData struct {
-		current  StatusPoint
-		timeline []storage.TimePoint
-	}
-
 	layerByKey := make(map[storage.MonitorKey]layerData, len(layerTasks))
 	for i, task := range layerTasks {
 		res := layerResults[i]
@@ -339,13 +354,7 @@ func (h *Handler) buildMonitorGroups(
 				timeline: h.buildTimeline(nil, endTime, period, degradedWeight, timeFilter),
 			}
 		}
-		layers = append(layers, MonitorLayer{
-			Model:         b.parent.Model,
-			RequestModel:  resolvedRequestModel(b.parent),
-			LayerOrder:    0,
-			CurrentStatus: parentData.current,
-			Timeline:      parentData.timeline,
-		})
+		layers = append(layers, newMonitorLayer(b.parent, 0, parentData))
 
 		// 子层（按配置顺序，LayerOrder=1..）
 		for i, child := range b.children {
@@ -362,13 +371,7 @@ func (h *Handler) buildMonitorGroups(
 					timeline: h.buildTimeline(nil, endTime, period, degradedWeight, timeFilter),
 				}
 			}
-			layers = append(layers, MonitorLayer{
-				Model:         child.Model,
-				RequestModel:  resolvedRequestModel(child),
-				LayerOrder:    i + 1,
-				CurrentStatus: d.current,
-				Timeline:      d.timeline,
-			})
+			layers = append(layers, newMonitorLayer(child, i+1, d))
 		}
 
 		// 组级最差状态：0 > 2 > 1 > -1

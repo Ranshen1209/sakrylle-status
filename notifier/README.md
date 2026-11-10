@@ -102,9 +102,26 @@ screenshot:
   base_url: "https://your-status.example.com"  # 截图目标 URL（占位符）
   timeout: "30s"                # 截图超时时间
   max_concurrent: 3             # 最大并发截图数
+  idle_timeout: "10m"           # 浏览器空闲多久后回收（下次截图重新懒加载，冷启动约 2s）
 ```
 
 启用截图时必须显式配置 `screenshot.base_url`，不要依赖代码中的上游历史默认值。
+
+> 浏览器进程常驻约 115MB。截图通常是低频操作，`idle_timeout` 到点后后台协程会关掉浏览器把这部分内存还给系统；小内存主机上别把它调得过大。
+
+### 社媒草稿（可选，默认关闭）
+
+```yaml
+social:
+  enabled: false
+  admin_chat_id: 0              # 接收草稿的站长 Telegram chat id（可向 @userinfobot 查询）
+  site_url: "https://relaypulse.top"  # 数据来源（公开 /api/status）与文案里的链接
+  check_interval: "5m"          # 多家异常的检查间隔
+  outage_min_providers: 5       # 同一服务方向至少这么多家全红才算多家异常
+  outage_ratio: 0.5             # 且占该方向服务商数不低于这个比例
+```
+
+只生成草稿私发给站长，不对外发布：每周一 10:00（北京时间）一份热板周报；同一服务方向多家同时异常时一份，回落后再一份。每份草稿分两条消息，第一条是只给站长看的口径和依据，第二条是可直接转发到群或复制到 X 的正文。告警时全红的服务商若有过半连续 2 小时以上不在热板数据里（移出热板或停止探测），就判断不了这次异常是否过去，只发一条说明、不出恢复草稿，之后该方向重新开始检测。需要配置 Telegram Bot Token。
 
 ## 环境变量
 
@@ -200,6 +217,8 @@ curl http://Windows电脑IP:3000/get_login_info
 | `/status` | 查看服务状态 |
 | `/help` | 显示帮助 |
 
+启用社媒草稿时，站长私聊另有 `/weekly`：立即预览一份周报草稿（不影响定时周报）。其他人发送会被当作未知命令。
+
 ### QQ 命令
 
 | 命令 | 权限 | 说明 |
@@ -224,8 +243,10 @@ curl http://Windows电脑IP:3000/get_login_info
 
 **截图功能说明**（`/snap` 命令）：
 - 需要在配置中启用 `screenshot.enabled: true`
-- 依赖 [Playwright](https://playwright.dev/docs/intro) 进行浏览器截图
-- 首次运行需安装 Chromium：`npx playwright install chromium`
+- 依赖 [playwright-go](https://github.com/mxschmitt/playwright-go) 进行浏览器截图
+- 首次截图时服务会自行下载驱动与 Chromium；要预先装好（例如构建镜像时）用与 `go.mod` 同版本的 CLI：
+  `go run github.com/mxschmitt/playwright-go/cmd/playwright@$(grep -oE 'playwright-go v\S+' go.mod | cut -d' ' -f2) install --with-deps chromium`
+  ⚠️ 别用 `npx playwright install`：npm 版装的驱动版本与 `go.mod` 钉的不一定一致，而 playwright-go 只认 `~/.cache/ms-playwright-go/<driver 版本>/`（如 `1.62.1/`，是 driver 版本不是模块版本）下的那一份驱动。浏览器本体在另一个目录 `~/.cache/ms-playwright/`，两边共用
 - 截图内容为当前订阅服务的状态监测图
 
 ## API 端点

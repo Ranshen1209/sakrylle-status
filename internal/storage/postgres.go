@@ -9,6 +9,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 
 	"monitor/internal/config"
@@ -134,6 +135,12 @@ func (s *PostgresStorage) Init() error {
 	if err := s.ensureErrorDetailColumn(); err != nil {
 		return err
 	}
+	if err := s.ensureProbeHistoryModelIDColumn(); err != nil {
+		return err
+	}
+	if err := s.ensureProbeHistoryModelIDIndex(); err != nil {
+		return err
+	}
 
 	// 在列迁移完成后创建索引
 	//
@@ -183,6 +190,10 @@ func (s *PostgresStorage) Init() error {
 
 	// 自动移板 override 持久化表
 	if err := s.initOverrideTables(ctx); err != nil {
+		return err
+	}
+	// 质量移板机器字段迁移（幂等 + 一次性 secondary 回填）
+	if err := s.ensureOverrideQualityColumns(); err != nil {
 		return err
 	}
 
@@ -333,6 +344,79 @@ func (s *PostgresStorage) ensureErrorDetailColumn() error {
 	return nil
 }
 
+// ensureProbeHistoryModelIDColumn 在旧表上添加 model_id 列（向后兼容，可空，无默认值）
+func (s *PostgresStorage) ensureProbeHistoryModelIDColumn() error {
+	ctx := s.effectiveCtx()
+	checkQuery := `
+		SELECT COUNT(*)
+		FROM information_schema.columns
+		WHERE table_schema = current_schema() AND table_name = 'probe_history' AND column_name = 'model_id'
+	`
+
+	var count int
+	if err := s.pool.QueryRow(ctx, checkQuery).Scan(&count); err != nil {
+		return fmt.Errorf("查询 PostgreSQL 表结构失败: %w", err)
+	}
+
+	if count > 0 {
+		return nil // 列已存在，无需添加
+	}
+
+	if _, err := s.pool.Exec(ctx, `ALTER TABLE probe_history ADD COLUMN model_id TEXT`); err != nil {
+		return fmt.Errorf("添加 model_id 列失败: %w", err)
+	}
+
+	logger.Info("storage", "已为 probe_history 表添加 model_id 列 (PostgreSQL)")
+	return nil
+}
+
+// ensureProbeHistoryModelIDIndex 创建 model_id 的部分覆盖索引（处理 invalid 残留，幂等）。
+// 使用 CREATE INDEX CONCURRENTLY，不能在事务内运行；Init() 的 ensure 段直接用 s.pool.Exec，符合此约束。
+func (s *PostgresStorage) ensureProbeHistoryModelIDIndex() error {
+	ctx := s.effectiveCtx()
+
+	// 检查索引是否存在，以及是否有效（CONCURRENTLY 中断会留下 invalid 索引）。
+	// 用 to_regclass 按当前 search_path 解析，并校验索引归属 probe_history，
+	// 避免其他 schema 下同名索引导致误判跳过创建（索引不存在时 to_regclass 返回 NULL → 0 行 → 走 no-rows 分支创建）。
+	var exists, valid bool
+	err := s.pool.QueryRow(ctx, `
+		SELECT true, i.indisvalid
+		FROM pg_class c
+		JOIN pg_index i ON i.indexrelid = c.oid
+		WHERE c.oid = to_regclass('idx_probe_history_mid_ts')
+		  AND i.indrelid = to_regclass('probe_history')`).Scan(&exists, &valid)
+	if err != nil {
+		// 没有行表示索引不存在，继续创建
+		if errors.Is(err, pgx.ErrNoRows) {
+			exists = false
+		} else {
+			return fmt.Errorf("检查 model_id 索引状态失败: %w", err)
+		}
+	}
+
+	if exists && !valid {
+		// 清理 CONCURRENTLY 中断后留下的 invalid 索引
+		if _, derr := s.pool.Exec(ctx, `DROP INDEX CONCURRENTLY IF EXISTS idx_probe_history_mid_ts`); derr != nil {
+			return fmt.Errorf("清理 invalid model_id 索引失败: %w", derr)
+		}
+		exists = false
+	}
+
+	if exists {
+		return nil // 索引已存在且有效，无需创建
+	}
+
+	if _, err := s.pool.Exec(ctx, `
+		CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_probe_history_mid_ts
+		ON probe_history (model_id, timestamp DESC)
+		INCLUDE (status, sub_status, latency, id, http_code)
+		WHERE model_id IS NOT NULL`); err != nil {
+		return fmt.Errorf("创建 model_id 索引失败: %w", err)
+	}
+
+	return nil
+}
+
 // MigrateChannelData 根据配置将 channel 为空的旧数据迁移到指定 channel
 func (s *PostgresStorage) MigrateChannelData(mappings []ChannelMigrationMapping) error {
 	ctx := s.effectiveCtx()
@@ -390,6 +474,59 @@ func (s *PostgresStorage) MigrateChannelData(mappings []ChannelMigrationMapping)
 	return nil
 }
 
+// BackfillProbeHistoryModelIDs 按映射把 model_id IS NULL 的历史行分批回填为对应 model_id（幂等）。
+// 歧义检查（同一 psc4 key 映射到多个不同 model_id）在任何写库操作前完成，发现歧义立即返回错误。
+func (s *PostgresStorage) BackfillProbeHistoryModelIDs(mappings []ModelIDMigrationMapping) error {
+	const backfillBatch = 5000
+
+	// 步骤一：歧义检查（Go 侧，写库前）
+	// 构建 psc4 -> model_id 的唯一映射，跳过 ModelID 为空的条目。
+	type psc4 struct{ provider, service, channel, model string }
+	seen := make(map[psc4]string, len(mappings))
+	for _, m := range mappings {
+		if m.ModelID == "" {
+			continue
+		}
+		k := psc4{m.Provider, m.Service, m.Channel, m.Model}
+		if existing, ok := seen[k]; ok && existing != m.ModelID {
+			return fmt.Errorf(
+				"model_id 回填歧义：(%s/%s/%s, model=%s) 映射到多个 model_id (%s vs %s)",
+				m.Provider, m.Service, m.Channel, m.Model, existing, m.ModelID,
+			)
+		}
+		seen[k] = m.ModelID
+	}
+
+	// 步骤二：对每个唯一映射执行分批 UPDATE（仅更新 model_id IS NULL 的行）
+	ctx := s.effectiveCtx()
+	var total int64
+	for k, modelID := range seen {
+		for {
+			tag, err := s.pool.Exec(ctx, `
+				WITH batch AS (
+					SELECT id FROM probe_history
+					WHERE model_id IS NULL AND provider = $1 AND service = $2 AND channel = $3 AND model = $4
+					LIMIT $5
+				)
+				UPDATE probe_history p SET model_id = $6
+				FROM batch WHERE p.id = batch.id`,
+				k.provider, k.service, k.channel, k.model, backfillBatch, modelID)
+			if err != nil {
+				return fmt.Errorf("回填 model_id 失败: %w", err)
+			}
+			n := tag.RowsAffected()
+			total += n
+			if n == 0 {
+				break
+			}
+		}
+	}
+	if total > 0 {
+		logger.Info("storage", "probe_history model_id 回填完成 (PostgreSQL)", "rows", total)
+	}
+	return nil
+}
+
 // Ping 检查数据库连通性
 func (s *PostgresStorage) Ping() error {
 	return s.pool.Ping(s.effectiveCtx())
@@ -410,8 +547,8 @@ func (s *PostgresStorage) Close() error {
 func (s *PostgresStorage) SaveRecord(record *ProbeRecord) error {
 	ctx := s.effectiveCtx()
 	query := `
-		INSERT INTO probe_history (provider, service, channel, model, status, sub_status, http_code, latency, timestamp, error_detail)
-		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
+		INSERT INTO probe_history (provider, service, channel, model, status, sub_status, http_code, latency, timestamp, error_detail, model_id)
+		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
 		RETURNING id
 	`
 
@@ -426,6 +563,7 @@ func (s *PostgresStorage) SaveRecord(record *ProbeRecord) error {
 		record.Latency,
 		record.Timestamp,
 		record.ErrorDetail,
+		record.ModelID,
 	).Scan(&record.ID)
 
 	if err != nil {
@@ -573,6 +711,164 @@ ORDER BY p.provider, p.service, p.channel, p.model, p.timestamp DESC
 
 	if err := rows.Err(); err != nil {
 		return nil, fmt.Errorf("迭代 PostgreSQL 历史记录失败: %w", err)
+	}
+
+	// DESC 取数利用索引，返回前对每个 key 翻转为时间升序
+	for k := range result {
+		reverseRecords(result[k])
+	}
+
+	return result, nil
+}
+
+// GetLatestBatchByModelID 按 model_id 批量获取每个监测项的最新记录（跨展示名历史连续）。
+//
+// 实现说明：
+// - CTE(keys) 仅承载 model_id 列，JOIN probe_history 命中部分覆盖索引 idx_probe_history_mid_ts
+// - DISTINCT ON (model_id) + ORDER BY timestamp DESC 取每个 model_id 的最新一条
+// - 结果 map 以入参 ProbeHistoryKey 为键，按 SELECT 出的 model_id 反查
+func (s *PostgresStorage) GetLatestBatchByModelID(keys []ProbeHistoryKey) (map[ProbeHistoryKey]*ProbeRecord, error) {
+	ctx := s.effectiveCtx()
+	result := make(map[ProbeHistoryKey]*ProbeRecord, len(keys))
+	if len(keys) == 0 {
+		return result, nil
+	}
+
+	keyByModelID, modelIDs := dedupModelIDKeys(keys)
+
+	var b strings.Builder
+	args := make([]any, 0, len(modelIDs))
+
+	b.WriteString("WITH keys(model_id) AS (VALUES ")
+	for i, modelID := range modelIDs {
+		if i > 0 {
+			b.WriteString(",")
+		}
+		fmt.Fprintf(&b, "($%d)", len(args)+1)
+		args = append(args, modelID)
+	}
+	b.WriteString(")\n")
+	b.WriteString(`
+SELECT DISTINCT ON (p.model_id)
+	p.model_id, p.id, p.provider, p.service, p.channel, p.model, p.status, p.sub_status, p.http_code, p.latency, p.timestamp
+FROM probe_history p
+JOIN keys k ON p.model_id = k.model_id
+ORDER BY p.model_id, p.timestamp DESC, p.id DESC
+`)
+
+	rows, err := s.pool.Query(ctx, b.String(), args...)
+	if err != nil {
+		return nil, fmt.Errorf("按 model_id 批量查询 PostgreSQL 最新记录失败: %w", err)
+	}
+	defer rows.Close()
+
+	for rows.Next() {
+		rec := &ProbeRecord{}
+		var modelID string
+		var subStatusStr string
+		if err := rows.Scan(
+			&modelID,
+			&rec.ID,
+			&rec.Provider,
+			&rec.Service,
+			&rec.Channel,
+			&rec.Model,
+			&rec.Status,
+			&subStatusStr,
+			&rec.HttpCode,
+			&rec.Latency,
+			&rec.Timestamp,
+		); err != nil {
+			return nil, fmt.Errorf("扫描 model_id PostgreSQL 最新记录失败: %w", err)
+		}
+		rec.SubStatus = SubStatus(subStatusStr)
+		rec.ModelID = modelID
+		if key, ok := keyByModelID[modelID]; ok {
+			result[key] = rec
+		}
+	}
+
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("迭代 model_id PostgreSQL 最新记录失败: %w", err)
+	}
+
+	return result, nil
+}
+
+// GetHistoryBatchByModelID 按 model_id 批量获取多个监测项的历史记录（时间范围，跨展示名历史连续）。
+//
+// 实现说明：
+// - CTE(keys) 仅承载 model_id，JOIN 命中部分索引；ORDER BY model_id, timestamp DESC 便于分桶
+// - 返回前对每个 key 的切片 reverse，保证时间升序（与 GetHistoryBatch 一致）
+// - 结果 map 以入参 ProbeHistoryKey 为键，按 SELECT 出的 model_id 反查
+func (s *PostgresStorage) GetHistoryBatchByModelID(keys []ProbeHistoryKey, since time.Time) (map[ProbeHistoryKey][]*ProbeRecord, error) {
+	ctx := s.effectiveCtx()
+	result := make(map[ProbeHistoryKey][]*ProbeRecord, len(keys))
+	if len(keys) == 0 {
+		return result, nil
+	}
+
+	keyByModelID, modelIDs := dedupModelIDKeys(keys)
+
+	var b strings.Builder
+	args := make([]any, 0, len(modelIDs)+1)
+
+	b.WriteString("WITH keys(model_id) AS (VALUES ")
+	for i, modelID := range modelIDs {
+		if i > 0 {
+			b.WriteString(",")
+		}
+		fmt.Fprintf(&b, "($%d)", len(args)+1)
+		args = append(args, modelID)
+	}
+
+	sinceArgIndex := len(args) + 1
+	args = append(args, since.Unix())
+
+	b.WriteString(")\n")
+	fmt.Fprintf(&b, `
+SELECT
+	p.model_id, p.id, p.provider, p.service, p.channel, p.model, p.status, p.sub_status, p.http_code, p.latency, p.timestamp
+FROM probe_history p
+JOIN keys k ON p.model_id = k.model_id
+WHERE p.timestamp >= $%d
+ORDER BY p.model_id, p.timestamp DESC
+`, sinceArgIndex)
+
+	rows, err := s.pool.Query(ctx, b.String(), args...)
+	if err != nil {
+		return nil, fmt.Errorf("按 model_id 批量查询 PostgreSQL 历史记录失败: %w", err)
+	}
+	defer rows.Close()
+
+	for rows.Next() {
+		rec := &ProbeRecord{}
+		var modelID string
+		var subStatusStr string
+		if err := rows.Scan(
+			&modelID,
+			&rec.ID,
+			&rec.Provider,
+			&rec.Service,
+			&rec.Channel,
+			&rec.Model,
+			&rec.Status,
+			&subStatusStr,
+			&rec.HttpCode,
+			&rec.Latency,
+			&rec.Timestamp,
+		); err != nil {
+			return nil, fmt.Errorf("扫描 model_id PostgreSQL 历史记录失败: %w", err)
+		}
+		rec.SubStatus = SubStatus(subStatusStr)
+		rec.ModelID = modelID
+		if key, ok := keyByModelID[modelID]; ok {
+			result[key] = append(result[key], rec)
+		}
+	}
+
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("迭代 model_id PostgreSQL 历史记录失败: %w", err)
 	}
 
 	// DESC 取数利用索引，返回前对每个 key 翻转为时间升序
@@ -859,6 +1155,267 @@ ORDER BY
 	return result, nil
 }
 
+// GetTimelineAggBatchByModelID 按 model_id 批量获取时间轴 bucket 聚合结果（时间范围，跨展示名历史连续）。
+//
+// 语义与 GetTimelineAggBatch 完全一致（bucket 归属、边界排除、时段过滤、统计口径、http_code_breakdown），
+// 唯一差异：查询/分桶键从四元组 (provider,service,channel,model) 改为单列 model_id。
+// 结果 map 以入参 ProbeHistoryKey 为键，按聚合行输出的 model_id 反查命中。
+func (s *PostgresStorage) GetTimelineAggBatchByModelID(keys []ProbeHistoryKey, since, endTime time.Time, bucketCount int, bucketWindow time.Duration, timeFilter *DailyTimeFilter) (map[ProbeHistoryKey][]AggBucketRow, error) {
+	ctx := s.effectiveCtx()
+	result := make(map[ProbeHistoryKey][]AggBucketRow, len(keys))
+	if len(keys) == 0 {
+		return result, nil
+	}
+	if bucketCount <= 0 {
+		return result, nil
+	}
+
+	windowSec := int64(bucketWindow / time.Second)
+	if windowSec <= 0 {
+		return nil, fmt.Errorf("无效的 bucketWindow: %s", bucketWindow)
+	}
+
+	keyByModelID, modelIDs := dedupModelIDKeys(keys)
+
+	sinceUnix := since.Unix()
+	endUnix := endTime.Unix()
+
+	var b strings.Builder
+	args := make([]any, 0, len(modelIDs)+8)
+
+	// keys CTE：仅承载 model_id
+	b.WriteString("WITH keys(model_id) AS (VALUES ")
+	for i, modelID := range modelIDs {
+		if i > 0 {
+			b.WriteString(",")
+		}
+		fmt.Fprintf(&b, "($%d)", len(args)+1)
+		args = append(args, modelID)
+	}
+	b.WriteString(")\n")
+
+	// 额外参数（紧跟 keys 之后）
+	sinceArg := len(args) + 1
+	args = append(args, sinceUnix)
+	endArg := len(args) + 1
+	args = append(args, endUnix)
+	windowSecArg := len(args) + 1
+	args = append(args, windowSec)
+	bucketCountArg := len(args) + 1
+	args = append(args, bucketCount)
+
+	// 时段过滤条件（UTC，左闭右开）
+	timeFilterCond := ""
+	if timeFilter != nil {
+		startMinArg := len(args) + 1
+		args = append(args, timeFilter.StartMinutes)
+		endMinArg := len(args) + 1
+		args = append(args, timeFilter.EndMinutes)
+
+		minutesExpr := "(EXTRACT(HOUR FROM timezone('UTC', to_timestamp(p.timestamp)))::int * 60 + EXTRACT(MINUTE FROM timezone('UTC', to_timestamp(p.timestamp)))::int)"
+		if timeFilter.CrossMidnight {
+			// 跨午夜： [start, 24:00) ∪ [00:00, end)
+			timeFilterCond = fmt.Sprintf(" AND (%s >= $%d OR %s < $%d)", minutesExpr, startMinArg, minutesExpr, endMinArg)
+		} else {
+			// 正常： [start, end)
+			timeFilterCond = fmt.Sprintf(" AND (%s >= $%d AND %s < $%d)", minutesExpr, startMinArg, minutesExpr, endMinArg)
+		}
+	}
+
+	// filtered：先计算 bucket_idx（口径与 GetTimelineAggBatch / api.buildTimeline 一致），再做聚合
+	// 不再 SELECT 四元组列——分组键已是 model_id
+	fmt.Fprintf(&b, `
+, filtered AS (
+	SELECT
+		p.model_id,
+		p.id,
+		p.status,
+		p.sub_status,
+		p.http_code,
+		p.latency,
+		p.timestamp,
+		($%d::int - 1 - (($%d::bigint - p.timestamp) / $%d::bigint))::int AS bucket_idx
+	FROM probe_history p
+	JOIN keys k ON p.model_id = k.model_id
+	WHERE p.timestamp > $%d
+	  AND p.timestamp <= $%d
+	  AND (($%d::bigint - p.timestamp) / $%d::bigint) < $%d::bigint
+%s
+)
+`, bucketCountArg, endArg, windowSecArg, sinceArg, endArg, endArg, windowSecArg, bucketCountArg, timeFilterCond)
+
+	// http_code_breakdown：仅统计红色(status==0)且有有效 http_code 的记录；分组键全部改为 model_id
+	b.WriteString(`
+, http_code_counts AS (
+	SELECT
+		model_id, bucket_idx, sub_status, http_code, COUNT(*)::int AS cnt
+	FROM filtered
+	WHERE status = 0
+	  AND http_code > 0
+	  AND sub_status IN ('server_error','client_error','auth_error','invalid_request','rate_limit')
+	GROUP BY model_id, bucket_idx, sub_status, http_code
+)
+, http_code_sub_agg AS (
+	SELECT
+		model_id, bucket_idx, sub_status,
+		jsonb_object_agg(http_code::text, cnt) AS codes
+	FROM http_code_counts
+	GROUP BY model_id, bucket_idx, sub_status
+)
+, http_code_bucket_agg AS (
+	SELECT
+		model_id, bucket_idx,
+		COALESCE(jsonb_object_agg(sub_status, codes), '{}'::jsonb) AS breakdown
+	FROM http_code_sub_agg
+	GROUP BY model_id, bucket_idx
+)
+SELECT
+	f.model_id,
+	f.bucket_idx,
+	COUNT(*)::int AS total,
+	(ARRAY_AGG(f.status ORDER BY f.timestamp DESC, f.id DESC))[1]::int AS last_status,
+	COALESCE(SUM(CASE WHEN f.status > 0 THEN f.latency ELSE 0 END), 0)::bigint AS latency_sum,
+	COALESCE(SUM(CASE WHEN f.status > 0 THEN 1 ELSE 0 END), 0)::int AS latency_count,
+	COALESCE(SUM(CASE WHEN f.latency > 0 THEN f.latency ELSE 0 END), 0)::bigint AS all_latency_sum,
+	COALESCE(SUM(CASE WHEN f.latency > 0 THEN 1 ELSE 0 END), 0)::int AS all_latency_count,
+
+	COALESCE(SUM(CASE WHEN f.status = 1 THEN 1 ELSE 0 END), 0)::int AS available,
+	COALESCE(SUM(CASE WHEN f.status = 2 THEN 1 ELSE 0 END), 0)::int AS degraded,
+	COALESCE(SUM(CASE WHEN f.status = 0 THEN 1 ELSE 0 END), 0)::int AS unavailable,
+	COALESCE(SUM(CASE WHEN f.status NOT IN (0,1,2) THEN 1 ELSE 0 END), 0)::int AS missing,
+
+	COALESCE(SUM(CASE WHEN f.status = 2 AND f.sub_status = 'slow_latency' THEN 1 ELSE 0 END), 0)::int AS slow_latency,
+	COALESCE(SUM(CASE WHEN f.sub_status = 'rate_limit' AND f.status IN (0,2) THEN 1 ELSE 0 END), 0)::int AS rate_limit,
+
+	COALESCE(SUM(CASE WHEN f.status = 0 AND f.sub_status = 'server_error' THEN 1 ELSE 0 END), 0)::int AS server_error,
+	COALESCE(SUM(CASE WHEN f.status = 0 AND f.sub_status = 'client_error' THEN 1 ELSE 0 END), 0)::int AS client_error,
+	COALESCE(SUM(CASE WHEN f.status = 0 AND f.sub_status = 'auth_error' THEN 1 ELSE 0 END), 0)::int AS auth_error,
+	COALESCE(SUM(CASE WHEN f.status = 0 AND f.sub_status = 'invalid_request' THEN 1 ELSE 0 END), 0)::int AS invalid_request,
+	COALESCE(SUM(CASE WHEN f.status = 0 AND f.sub_status = 'network_error' THEN 1 ELSE 0 END), 0)::int AS network_error,
+	COALESCE(SUM(CASE WHEN f.status = 0 AND f.sub_status = 'response_timeout' THEN 1 ELSE 0 END), 0)::int AS response_timeout,
+	COALESCE(SUM(CASE WHEN f.status = 0 AND f.sub_status = 'content_mismatch' THEN 1 ELSE 0 END), 0)::int AS content_mismatch,
+
+	COALESCE(h.breakdown, '{}'::jsonb) AS http_code_breakdown
+FROM filtered f
+LEFT JOIN http_code_bucket_agg h
+	ON h.model_id = f.model_id AND h.bucket_idx = f.bucket_idx
+GROUP BY
+	f.model_id, f.bucket_idx, h.breakdown
+ORDER BY
+	f.model_id, f.bucket_idx
+`)
+
+	rows, err := s.pool.Query(ctx, b.String(), args...)
+	if err != nil {
+		return nil, fmt.Errorf("按 model_id 批量查询 PostgreSQL 时间轴聚合失败: %w", err)
+	}
+	defer rows.Close()
+
+	for rows.Next() {
+		var (
+			modelID         string
+			bucketIdx       int
+			total           int
+			lastStatus      int
+			latencySum      int64
+			latencyCount    int
+			allLatencySum   int64
+			allLatencyCount int
+
+			available       int
+			degraded        int
+			unavailable     int
+			missing         int
+			slowLatency     int
+			rateLimit       int
+			serverError     int
+			clientError     int
+			authError       int
+			invalidRequest  int
+			networkError    int
+			responseTimeout int
+			contentMismatch int
+
+			breakdownRaw []byte
+		)
+
+		if err := rows.Scan(
+			&modelID,
+			&bucketIdx,
+			&total,
+			&lastStatus,
+			&latencySum,
+			&latencyCount,
+			&allLatencySum,
+			&allLatencyCount,
+			&available,
+			&degraded,
+			&unavailable,
+			&missing,
+			&slowLatency,
+			&rateLimit,
+			&serverError,
+			&clientError,
+			&authError,
+			&invalidRequest,
+			&networkError,
+			&responseTimeout,
+			&contentMismatch,
+			&breakdownRaw,
+		); err != nil {
+			return nil, fmt.Errorf("扫描 model_id PostgreSQL 时间轴聚合结果失败: %w", err)
+		}
+
+		var httpCodeBreakdown map[string]map[int]int
+		// breakdownRaw 可能为 "{}" 或其他 jsonb
+		if len(breakdownRaw) > 0 && string(breakdownRaw) != "null" {
+			if err := json.Unmarshal(breakdownRaw, &httpCodeBreakdown); err != nil {
+				return nil, fmt.Errorf("解析 model_id PostgreSQL http_code_breakdown 失败: %w", err)
+			}
+			// 兼容：如果为空对象，保持空 map（omitempty 会省略）
+			if len(httpCodeBreakdown) == 0 {
+				httpCodeBreakdown = nil
+			}
+		}
+
+		key, ok := keyByModelID[modelID]
+		if !ok {
+			continue
+		}
+		result[key] = append(result[key], AggBucketRow{
+			BucketIndex:     bucketIdx,
+			Total:           total,
+			LastStatus:      lastStatus,
+			LatencySum:      latencySum,
+			LatencyCount:    latencyCount,
+			AllLatencySum:   allLatencySum,
+			AllLatencyCount: allLatencyCount,
+			StatusCounts: StatusCounts{
+				Available:         available,
+				Degraded:          degraded,
+				Unavailable:       unavailable,
+				Missing:           missing,
+				SlowLatency:       slowLatency,
+				RateLimit:         rateLimit,
+				ServerError:       serverError,
+				ClientError:       clientError,
+				AuthError:         authError,
+				InvalidRequest:    invalidRequest,
+				NetworkError:      networkError,
+				ResponseTimeout:   responseTimeout,
+				ContentMismatch:   contentMismatch,
+				HttpCodeBreakdown: httpCodeBreakdown,
+			},
+		})
+	}
+
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("迭代 model_id PostgreSQL 时间轴聚合结果失败: %w", err)
+	}
+
+	return result, nil
+}
+
 // GetLatest 获取最新记录
 func (s *PostgresStorage) GetLatest(provider, service, channel, model string) (*ProbeRecord, error) {
 	ctx := s.effectiveCtx()
@@ -945,6 +1502,144 @@ func (s *PostgresStorage) GetHistory(provider, service, channel, model string, s
 
 	// DESC 取数利用索引，返回前翻转为时间升序
 	reverseRecords(records)
+
+	return records, nil
+}
+
+// GetLatestByModelID 按 model_id 获取最新一条记录（跨展示名历史连续）。
+func (s *PostgresStorage) GetLatestByModelID(modelID string) (*ProbeRecord, error) {
+	ctx := s.effectiveCtx()
+	query := `
+		SELECT id, provider, service, channel, model, status, sub_status, http_code, latency, timestamp
+		FROM probe_history
+		WHERE model_id = $1
+		ORDER BY timestamp DESC, id DESC
+		LIMIT 1
+	`
+
+	var record ProbeRecord
+	var subStatusStr string
+	err := s.pool.QueryRow(ctx, query, modelID).Scan(
+		&record.ID,
+		&record.Provider,
+		&record.Service,
+		&record.Channel,
+		&record.Model,
+		&record.Status,
+		&subStatusStr,
+		&record.HttpCode,
+		&record.Latency,
+		&record.Timestamp,
+	)
+
+	if err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return nil, nil
+		}
+		return nil, fmt.Errorf("按 model_id 查询 PostgreSQL 最新记录失败: %w", err)
+	}
+
+	record.SubStatus = SubStatus(subStatusStr)
+	record.ModelID = modelID
+	return &record, nil
+}
+
+// GetHistoryByModelID 按 model_id 获取 since 之后的历史记录（时间升序，跨展示名历史连续）。
+func (s *PostgresStorage) GetHistoryByModelID(modelID string, since time.Time) ([]*ProbeRecord, error) {
+	ctx := s.effectiveCtx()
+	query := `
+		SELECT id, provider, service, channel, model, status, sub_status, http_code, latency, timestamp
+		FROM probe_history
+		WHERE model_id = $1 AND timestamp >= $2
+		ORDER BY timestamp DESC
+	`
+
+	rows, err := s.pool.Query(ctx, query, modelID, since.Unix())
+	if err != nil {
+		return nil, fmt.Errorf("按 model_id 查询 PostgreSQL 历史记录失败: %w", err)
+	}
+	defer rows.Close()
+
+	var records []*ProbeRecord
+	for rows.Next() {
+		var record ProbeRecord
+		var subStatusStr string
+		if err := rows.Scan(
+			&record.ID,
+			&record.Provider,
+			&record.Service,
+			&record.Channel,
+			&record.Model,
+			&record.Status,
+			&subStatusStr,
+			&record.HttpCode,
+			&record.Latency,
+			&record.Timestamp,
+		); err != nil {
+			return nil, fmt.Errorf("扫描 model_id PostgreSQL 历史记录失败: %w", err)
+		}
+		record.SubStatus = SubStatus(subStatusStr)
+		record.ModelID = modelID
+		records = append(records, &record)
+	}
+
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("迭代 model_id PostgreSQL 历史记录失败: %w", err)
+	}
+
+	reverseRecords(records)
+	return records, nil
+}
+
+// GetHistoryWithLimitByModelID 按 model_id 获取 since 之后最近 limit 条记录（timestamp DESC + id DESC）。
+// 返回值保留时间倒序（最新在前）；包含 ErrorDetail 字段。
+func (s *PostgresStorage) GetHistoryWithLimitByModelID(modelID string, since time.Time, limit int) ([]*ProbeRecord, error) {
+	ctx := s.effectiveCtx()
+	if limit <= 0 {
+		limit = 200
+	}
+
+	query := `
+		SELECT id, provider, service, channel, model, status, sub_status, http_code, latency, timestamp, error_detail
+		FROM probe_history
+		WHERE model_id = $1 AND timestamp >= $2
+		ORDER BY timestamp DESC, id DESC
+		LIMIT $3
+	`
+
+	rows, err := s.pool.Query(ctx, query, modelID, since.Unix(), limit)
+	if err != nil {
+		return nil, fmt.Errorf("按 model_id 查询 PostgreSQL 限量历史记录失败: %w", err)
+	}
+	defer rows.Close()
+
+	records := make([]*ProbeRecord, 0, limit)
+	for rows.Next() {
+		var record ProbeRecord
+		var subStatusStr string
+		if err := rows.Scan(
+			&record.ID,
+			&record.Provider,
+			&record.Service,
+			&record.Channel,
+			&record.Model,
+			&record.Status,
+			&subStatusStr,
+			&record.HttpCode,
+			&record.Latency,
+			&record.Timestamp,
+			&record.ErrorDetail,
+		); err != nil {
+			return nil, fmt.Errorf("扫描 model_id PostgreSQL 限量历史记录失败: %w", err)
+		}
+		record.SubStatus = SubStatus(subStatusStr)
+		record.ModelID = modelID
+		records = append(records, &record)
+	}
+
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("迭代 model_id PostgreSQL 限量历史记录失败: %w", err)
+	}
 
 	return records, nil
 }
@@ -1710,11 +2405,48 @@ func (s *PostgresStorage) initOverrideTables(ctx context.Context) error {
 	return nil
 }
 
+// ensureOverrideQualityColumns 补齐质量移板列（幂等，SQLite 版的 PG 孪生）。
+// availability_latched 列本次新增时一次性回填既有 secondary 行为可用率闩锁——
+// 理由与守卫同 SQLite 版：本功能上线前 secondary 必为可用率驱动降板，不回填会被
+// Restore 误升板；以「本次是否新增该列」为守卫，绝不无条件每次 Init 都跑。
+func (s *PostgresStorage) ensureOverrideQualityColumns() error {
+	ctx := s.effectiveCtx()
+	var availabilityLatchedExisted bool
+	if err := s.pool.QueryRow(ctx,
+		`SELECT EXISTS(SELECT 1 FROM information_schema.columns WHERE table_schema = current_schema() AND table_name='monitor_overrides' AND column_name='availability_latched')`,
+	).Scan(&availabilityLatchedExisted); err != nil {
+		return fmt.Errorf("查询 monitor_overrides 列是否存在失败 (PostgreSQL): %w", err)
+	}
+	migrations := []string{
+		`ALTER TABLE monitor_overrides ADD COLUMN IF NOT EXISTS board_reason TEXT NOT NULL DEFAULT ''`,
+		`ALTER TABLE monitor_overrides ADD COLUMN IF NOT EXISTS quality_latched BOOLEAN NOT NULL DEFAULT FALSE`,
+		`ALTER TABLE monitor_overrides ADD COLUMN IF NOT EXISTS quality_recovery_count INTEGER NOT NULL DEFAULT 0`,
+		`ALTER TABLE monitor_overrides ADD COLUMN IF NOT EXISTS quality_trigger_models TEXT NOT NULL DEFAULT ''`,
+		`ALTER TABLE monitor_overrides ADD COLUMN IF NOT EXISTS quality_last_generation BIGINT NOT NULL DEFAULT 0`,
+		`ALTER TABLE monitor_overrides ADD COLUMN IF NOT EXISTS availability_latched BOOLEAN NOT NULL DEFAULT FALSE`,
+	}
+	for _, m := range migrations {
+		if _, err := s.pool.Exec(ctx, m); err != nil {
+			return fmt.Errorf("迁移 monitor_overrides 失败 (PostgreSQL): %w", err)
+		}
+	}
+	if !availabilityLatchedExisted {
+		if _, err := s.pool.Exec(ctx, `UPDATE monitor_overrides SET availability_latched = TRUE WHERE board = 'secondary'`); err != nil {
+			return fmt.Errorf("回填 availability_latched 失败 (PostgreSQL): %w", err)
+		}
+		logger.Info("storage", "已为 monitor_overrides 表补齐质量移板列并回填 secondary 可用率闩锁 (PostgreSQL)")
+	}
+	return nil
+}
+
 // ListMonitorOverrides 加载全部 override 快照。
 func (s *PostgresStorage) ListMonitorOverrides() ([]MonitorOverrideRecord, error) {
 	ctx := s.effectiveCtx()
 	rows, err := s.pool.Query(ctx, `
-		SELECT provider, service, channel, model, board, cold_reason, sponsor_level, created_at, updated_at
+		SELECT provider, service, channel, model, board, cold_reason, sponsor_level,
+		       board_reason, quality_latched, quality_recovery_count,
+		       quality_trigger_models, quality_last_generation, availability_latched,
+		       created_at, updated_at
 		FROM monitor_overrides
 		ORDER BY provider, service, channel, model
 	`)
@@ -1726,13 +2458,18 @@ func (s *PostgresStorage) ListMonitorOverrides() ([]MonitorOverrideRecord, error
 	var records []MonitorOverrideRecord
 	for rows.Next() {
 		var r MonitorOverrideRecord
+		// PG BIGINT 扫进 int64 再转 uint64（真实代次值不超 2^63）
+		var qGen int64
 		if err := rows.Scan(
 			&r.Key.Provider, &r.Key.Service, &r.Key.Channel, &r.Key.Model,
 			&r.Board, &r.ColdReason, &r.SponsorLevel,
+			&r.BoardReason, &r.QualityLatched, &r.QualityRecoveryCount,
+			&r.QualityTriggerModels, &qGen, &r.AvailabilityLatched,
 			&r.CreatedAt, &r.UpdatedAt,
 		); err != nil {
 			return nil, fmt.Errorf("扫描 monitor_overrides 失败 (PostgreSQL): %w", err)
 		}
+		r.QualityLastGeneration = uint64(qGen)
 		records = append(records, r)
 	}
 	if err := rows.Err(); err != nil {
@@ -1777,8 +2514,11 @@ func (s *PostgresStorage) ReplaceMonitorOverrides(records []MonitorOverrideRecor
 	if len(records) > 0 {
 		const insertSQL = `
 			INSERT INTO monitor_overrides (
-				provider, service, channel, model, board, cold_reason, sponsor_level, created_at, updated_at
-			) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+				provider, service, channel, model, board, cold_reason, sponsor_level,
+				board_reason, quality_latched, quality_recovery_count,
+				quality_trigger_models, quality_last_generation, availability_latched,
+				created_at, updated_at
+			) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15)
 		`
 		now := time.Now().Unix()
 		for _, r := range records {
@@ -1794,7 +2534,10 @@ func (s *PostgresStorage) ReplaceMonitorOverrides(records []MonitorOverrideRecor
 
 			if _, err := tx.Exec(ctx, insertSQL,
 				r.Key.Provider, r.Key.Service, r.Key.Channel, r.Key.Model,
-				r.Board, r.ColdReason, r.SponsorLevel, createdAt, updatedAt,
+				r.Board, r.ColdReason, r.SponsorLevel,
+				r.BoardReason, r.QualityLatched, r.QualityRecoveryCount,
+				r.QualityTriggerModels, int64(r.QualityLastGeneration), r.AvailabilityLatched,
+				createdAt, updatedAt,
 			); err != nil {
 				return fmt.Errorf("写入 monitor_overrides 失败 (PostgreSQL): %w", err)
 			}

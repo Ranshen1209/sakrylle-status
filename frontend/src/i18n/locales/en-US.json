@@ -12,6 +12,7 @@
     "close": "Close",
     "apply": "Apply filters",
     "clear": "Clear all filters",
+    "save": "Save",
     "sponsor": "Sponsor",
     "channel": "Channel",
     "latency": "Latency",
@@ -41,12 +42,14 @@
     }
   },
   "header": {
-    "brand": "Sakrylle Status",
     "tagline": "Live availability monitor for Sakrylle API",
+    "contactBtn": "Contact Us",
+    "contactBtnShort": "Contact",
     "stats": {
       "healthy": "Operational",
       "issues": "Issues detected"
-    }
+    },
+    "brand": "Sakrylle Status"
   },
   "controls": {
     "filters": {
@@ -54,7 +57,9 @@
       "categoryLabel": "Service category",
       "provider": "All providers",
       "service": "All services",
-      "channel": "All channels"
+      "channel": "All channels",
+      "vendor": "All vendors",
+      "model": "All models"
     },
     "categories": {
       "charity": "Charity",
@@ -130,6 +135,10 @@
       "disabled": "Auto-refresh: Paused",
       "enabledHint": "Auto-refreshing, click to pause",
       "disabledHint": "Paused, click to resume"
+    },
+    "drawings": {
+      "show": "Show drawing column",
+      "hide": "Hide drawing column"
     }
   },
   "favorites": {
@@ -142,17 +151,23 @@
     }
   },
   "table": {
+    "qualityHintLink": "Relay quality detection",
     "headers": {
-      "annotation": "Annotations",
+      "annotation": "Tags",
       "provider": "Provider",
       "sponsor": "Sponsor",
       "service": "Service",
+      "serviceTooltip": "The Service column shows the API protocol family you connect with: CC is the Anthropic Messages API (Claude Code), CX the OpenAI API (Codex CLI), GM the Gemini API. The vendor icon before each model name identifies its manufacturer.",
       "channel": "Channel",
       "model": "Model",
       "priceRatio": "Price",
       "priceRatioLine1": "Price",
       "priceRatioLine2": "¥/$",
       "priceRatioTooltip": "How many CNY per 1 USD of tokens, for reference only",
+      "quality": "Quality",
+      "qualityTooltip": "Independent quality score (0-100) sampled by <diag>diag.relaypulse.top</diag>. Each model in the channel renders its own 5-point sparkline (30d avg / 7d avg / 3 most-recent samples) overlaid; two reference lines at 80 / 100 act as the Y-axis scale.",
+      "drawing": "Drawing",
+      "drawingTooltip": "The \"pelican riding a bicycle\" SVG the model drew in rpdiag's last 3 scored tests. The cell shows the newest one (faded when older than 7 days); hover to see all 3, each with the same group's official drawing in the corner. The drawing style is only a visual reference.",
       "listedDays": "Listed Days",
       "listedDaysLine1": "Listed",
       "listedDaysLine2": "Days",
@@ -168,7 +183,8 @@
       "lastCheck": "Status/Latency",
       "service": "Service type",
       "priceRatio": "Price",
-      "listedDays": "Listed"
+      "listedDays": "Listed",
+      "quality": "Quality"
     },
     "categoryLabels": {
       "promoted": "Commercial",
@@ -180,14 +196,17 @@
     },
     "expandDetails": "View details",
     "collapseDetails": "Hide details",
+    "qualityPending": "Pending",
+    "qualityPendingTooltip": "Monitored, but rpdiag hasn't sampled this channel's quality yet — it will once it comes up in rotation.",
     "heatmapHint": "Click a cell for details (aggregated {{from}} → {{to}} data points)",
     "timeLabels": {
       "24h": "24h",
       "days": "{{count}}d"
     },
+    "modelVendorTooltip": "Model vendor: {{vendor}} ({{code}}). Whose model this channel actually runs — separate from the access protocol shown in the Service column.",
     "channelType": {
-      "official": "Official channel",
-      "officialDesc": "Provider claims to use official API",
+      "official": "Official direct / resale",
+      "officialDesc": "Provider claims a direct official endpoint or an official resale route (e.g. a cloud platform), and marks it as neither reverse-engineered nor mixed",
       "reverse": "Reverse channel",
       "reverseDesc": "Provider marks as reverse-engineered",
       "mixed": "Mixed channel",
@@ -199,9 +218,24 @@
       "channelType": "Channel Type",
       "probeUrl": "Probe URL",
       "template": "Body Template",
-      "coldReason": "Cold Reason"
+      "coldReason": "Cold Reason",
+      "qualityHardFail": {
+        "label": "Quality Demotion",
+        "text": "{{models}} returned no scorable response in the last 3 evaluations; moved to the backup board",
+        "textNoModels": "No scorable response in the last 3 evaluations; moved to the backup board"
+      }
     },
-    "filterByProvider": "Filter by this provider"
+    "filterByProvider": "Filter by this provider",
+    "drawing": {
+      "tooltipNote": "A single drawing is only a reference: the official model draws in varying styles too. The small corner image is the same group's official drawing.",
+      "moreLink": "View on rpdiag",
+      "latestAlt": "Drawing from the latest scored test ({{time}})",
+      "staleAlt": "The latest scored test is over 7 days old ({{time}}); recent tests produced no score",
+      "candidateAlt": "Channel drawing ({{time}})",
+      "officialAlt": "Official drawing from the same group",
+      "failed": "Drawing failed",
+      "none": "No drawing"
+    }
   },
   "card": {
     "uptime": "Uptime:"
@@ -221,7 +255,10 @@
     "invalid_request": "Invalid request parameters",
     "network_error": "Network error",
     "response_timeout": "Response timeout",
-    "content_mismatch": "Content validation failed"
+    "content_mismatch": "Content validation failed",
+    "redirect_blocked": "Redirect blocked",
+    "response_too_large": "Response too large",
+    "concurrency_limited": "Concurrency limited"
   },
   "tooltip": {
     "title": "Data details",
@@ -234,7 +271,28 @@
     "httpCodeBreakdown": "HTTP code breakdown"
   },
   "footer": {
-    "githubAria": "GitHub"
+    "detectLink": "Relay detection",
+    "disclaimer": {
+      "title": "Platform Statement",
+      "dataReference": {
+        "title": "Real Consumption Probing",
+        "text": "Probes are initiated based on actual token usage; results vary with network conditions and provider load, faithfully reflecting API response quality"
+      },
+      "neutralMaintenance": {
+        "title": "Open and Transparent Operations",
+        "text": "Entire codebase is open source under MIT license, self-hosting available for verification. Sponsors receive pinned display, exclusive tags, and high-frequency monitoring, but availability data remains objective and accurate"
+      },
+      "monitoringScope": {
+        "title": "Full-Stack Protocol Verification",
+        "text": "Covers TCP connectivity, RTT latency, and deep validation of response content, effectively detecting \"fake alive\" APIs that connect but cannot converse"
+      },
+      "liability": {
+        "title": "Disclaimer",
+        "text": "Monitoring data is for technical reference only and does not constitute endorsement of any third-party provider's credibility or financial security. Users interact with providers at their own risk"
+      }
+    },
+    "issuesBtn": "Report an issue",
+    "openSourceLabel": "Open source project, contributions welcome"
   },
   "provider": {
     "pageTitle": "{{name}} - Service Monitoring",
@@ -258,6 +316,12 @@
     "composite": "Composite",
     "modelPrefix": "🔄"
   },
+  "share": {
+    "share": "Share",
+    "shareShort": "Share",
+    "linkCopied": "Link copied to clipboard",
+    "copyFailed": "Failed to copy, please copy the link manually"
+  },
   "externalLink": {
     "title": "Leaving Sakrylle Status",
     "target": "Target website",
@@ -275,14 +339,19 @@
     "switchTheme": "Switch theme",
     "selectTheme": "Select theme",
     "defaultDark": "Default Dark",
+    "nightDark": "Night Dark",
     "lightCool": "Light Cool",
+    "lightWarm": "Light Warm",
     "defaultDarkShort": "Dark",
-    "lightCoolShort": "Cool"
+    "nightDarkShort": "Night",
+    "lightCoolShort": "Cool",
+    "lightWarmShort": "Warm"
   },
   "community": {
     "title": "Join Community",
     "items": {
-      "qqGroup": "QQ Group"
+      "qqGroup": "QQ Group",
+      "telegramGroup": "Telegram Group"
     },
     "groupNumber": "Group ID",
     "joinLink": "Click to join",
@@ -294,6 +363,254 @@
     "close": "Close",
     "discussions": "Discussions",
     "moreAnnouncements": "{{count}} more announcement(s)"
+  },
+  "onboarding": {
+    "meta": {
+      "title": "Apply for Listing",
+      "description": "Submit your API service to Sakrylle Status monitoring platform"
+    },
+    "title": "Apply for Listing",
+    "description": "Submit your API service info and pass the connectivity test to apply",
+    "loading": "Loading form configuration...",
+    "metaErrorHint": "This feature may not be enabled yet. Please contact the administrator.",
+    "steps": {
+      "provider": "Provider",
+      "connection": "Test",
+      "confirm": "Confirm"
+    },
+    "next": "Next",
+    "back": "Back",
+    "providerInfo": {
+      "title": "Provider Information",
+      "agreementText": "I have read and agree to the",
+      "agreementLink": "listing agreement",
+      "providerName": "Provider Name",
+      "providerNamePlaceholder": "e.g. MyService",
+      "websiteUrl": "Website URL",
+      "category": "Category",
+      "categories": {
+        "commercial": "Commercial",
+        "public": "Public"
+      },
+      "serviceType": "Service Type",
+      "serviceTypes": {
+        "cc": "CC",
+        "cx": "CX",
+        "gm": "GM"
+      },
+      "identity": "Your Role",
+      "identities": {
+        "publicOwner": "Public Site Owner",
+        "publicOwnerDesc": "Submit your public site for testing or research, free to join",
+        "commercialOwner": "Commercial Site Owner",
+        "commercialOwnerDesc": "Submit your commercial site to attract users via the platform",
+        "personal": "Individual User",
+        "personalDesc": "Recommend great relay sites and earn rewards via affiliate links"
+      },
+      "sponsorLevel": "Sponsor Level",
+      "sponsorLevels": {
+        "public": "Public",
+        "signal": "Signal",
+        "pulse": "Pulse"
+      },
+      "channelType": "Channel Type",
+      "channelTypes": {
+        "O": "Official",
+        "ODesc": "Self-built account pool wired directly to official upstreams (subscription / official API / cloud). No reverse or third-party fallback.",
+        "R": "Reverse",
+        "RDesc": "Connected via non-official means such as reverse-engineered web sessions or scripts.",
+        "M": "Mixed",
+        "MDesc": "Multiple upstream kinds (official + reverse) combined, or with third-party fallback / backup pools."
+      },
+      "channelSource": "Channel Source",
+      "customSource": "Custom...",
+      "customSourcePlaceholder": "Enter custom source",
+      "channelSourceCustomPlaceholder": "Enter source name (uppercase/digits)",
+      "providerNameHint": "Your provider's display name. Any language, including Chinese, is supported (up to 100 characters). If it contains non-English characters, we will assign an English slug for URLs.",
+      "channelSourcePlaceholder": "Select an access source",
+      "channelSourceHint": "No suitable source? Contact ops to add one (QQ:18058344)",
+      "channelName": "Channel Display Name",
+      "channelNamePlaceholder": "e.g. Max Express Line",
+      "channelNameHint": "Shown in the status-page channel column (Unicode supported); falls back to the channel code when empty; up to {{max}} characters",
+      "channelNameInvalid": "At most {{max}} characters, without control or zero-width characters",
+      "channelGroup": "Channel Group Code",
+      "channelGroupHint": "1-8 lowercase letters or digits, used only to build the channel identifier (e.g. us, eu, v2), not as a display name; defaults to main",
+      "sourceCategories": {
+        "subscription": "Subscription",
+        "official": "Official API",
+        "cloud": "Cloud",
+        "reverse": "Reverse",
+        "mixed": "Mixed"
+      },
+      "channelCodePreview": "Channel Code Preview",
+      "optional": "(optional)"
+    },
+    "connectionTest": {
+      "title": "Connectivity Test",
+      "description": "Enter your API credentials and run a test. You can submit after the test passes.",
+      "baseUrl": "API Base URL",
+      "baseUrlHint": "Must use HTTPS",
+      "apiKey": "API Key",
+      "apiKeyPlaceholder": "Enter API Key",
+      "apiKeyHint": "Used only for verification and monitoring, stored encrypted",
+      "showApiKey": "Show API Key",
+      "hideApiKey": "Hide API Key",
+      "testType": "Service Type",
+      "runTest": "Run Test",
+      "rerunTest": "Re-test",
+      "testing": "Testing...",
+      "resultTitle": "Test Result",
+      "probeStatus": "Probe Status",
+      "latency": "Latency",
+      "httpCode": "HTTP Code",
+      "subStatus": "Sub Status",
+      "error": "Error",
+      "responseDetail": "Response detail",
+      "proofValid": "Test proof valid ({{time}} remaining)",
+      "proofExpired": "Test proof expired, please re-run the test",
+      "model": "Model to monitor",
+      "modelHint": "Pick the model this channel will be monitored on — the test and the listing use the same one",
+      "modelVendorUnknown": "Not listed / not sure",
+      "requestModel": "Requested model"
+    },
+    "test": {
+      "statusAvailable": "Available",
+      "statusDegraded": "Degraded",
+      "statusUnavailable": "Unavailable",
+      "statusUnknown": "Unknown"
+    },
+    "confirm": {
+      "title": "Confirm & Submit",
+      "description": "Please review the information below and submit your application",
+      "sectionProvider": "Provider Information",
+      "sectionConnection": "Connection Details",
+      "copy": "Copy",
+      "submit": "Submit Application",
+      "submitting": "Submitting...",
+      "successTitle": "Application Submitted!",
+      "successDescription": "We will review your application shortly",
+      "publicId": "Application ID",
+      "publicIdHint": "Save this ID and provide it when you contact the admin for review",
+      "contactLabel": "Contact for Review",
+      "copyTemplateHint": "Copy contact template:",
+      "contactTemplate": "Hi, I submitted a listing application (ID: {{id}}, provider: {{provider}}), please review.",
+      "newSubmission": "New Application",
+      "proofExpiredBanner": "Test proof expired, please go back and re-run the test",
+      "proofExpiringSoon": "Test proof is about to expire, please submit soon",
+      "agreement": {
+        "title": "Listing Terms & Acknowledgement",
+        "intro": "pulse-tier listing on this platform is free; business tiers are paid sponsorship. Please read and check each item below; you may submit only after confirming all of them:",
+        "clausePaid": "I understand that pulse-tier listing is free; beacon tier and above are paid sponsorship (prepaid monthly; lapsed renewals are auto-downgraded to pulse, with no refund of fees already paid).",
+        "clauseApiKey": "I authorize the platform to use the provided API Key for config validation, availability monitoring and in-depth quality detection (including response metadata, SSE timing, cache tokens, model fields and self-reported identity parsing, covering diag.relaypulse.top) and related display; listing is not possible without this consent.",
+        "clauseQuality": "I warrant that the channel's actual model quality matches the declared source (an official declaration must be a genuine official API); if inconsistent, the platform may add a negative annotation, delist, or move it to the cold board.",
+        "clauseNoCheat": "I warrant that I will not cheat the platform's availability or quality probes in any form, including faking or caching probe responses, echoing the probe's expected answer, or returning a response to identified probes that differs from what real users receive. Once confirmed, the platform will immediately delist the channel and issue a public notice.",
+        "clauseLegit": "I hold lawful rights to use the provided endpoint, API Key, brand and links, and the submitted information is truthful, accurate and compliant.",
+        "clauseNoEndorse": "I understand sponsorship badges and pinning are display/monitoring benefits only and do not constitute the platform's endorsement of reputation, funds or service quality; the platform may unilaterally delist for compliance risk or complaints.",
+        "fullText": "Full terms:",
+        "fullLink": "Listing Terms & Acknowledgement",
+        "allRequiredHint": "Please check all items before submitting"
+      }
+    }
+  },
+  "contact": {
+    "meta": {
+      "title": "Contact Us | Sakrylle Status",
+      "description": "Apply for listing, request changes, or submit feedback"
+    },
+    "title": "Contact Us",
+    "description": "Choose the service you need, and we'll help you",
+    "apply": {
+      "title": "Apply for Listing",
+      "description": "Submit a new API service to the Sakrylle Status monitoring platform"
+    },
+    "change": {
+      "title": "Request Changes",
+      "description": "Modify the configuration of an already-listed channel (e.g. URL, API key)"
+    },
+    "feedback": {
+      "title": "Submit Feedback",
+      "description": "Suggestions, bug reports, or other inquiries"
+    },
+    "community": {
+      "title": "Join Community",
+      "description": "Join our QQ group to chat with other users"
+    },
+    "discussions": {
+      "title": "Discussions",
+      "description": "Ask questions, share ideas, and discuss on GitHub Discussions"
+    }
+  },
+  "changeRequest": {
+    "meta": {
+      "title": "Request Changes | Sakrylle Status",
+      "description": "Modify the configuration of an already-listed channel"
+    },
+    "title": "Request Changes",
+    "subtitle": "Verify your identity with your API Key to modify a listed channel's configuration",
+    "steps": {
+      "auth": "Verify",
+      "edit": "Edit",
+      "test": "Test",
+      "review": "Review"
+    },
+    "back": "Back",
+    "next": "Next",
+    "auth": {
+      "title": "Identity Verification",
+      "description": "Enter the API Key of your listed channel. The system will match the corresponding channel(s).",
+      "placeholder": "Enter API Key",
+      "submit": "Verify",
+      "invalidKey": "Please enter a valid API Key (at least 10 characters)",
+      "authFailed": "API Key verification failed"
+    },
+    "edit": {
+      "title": "Edit Channel Info",
+      "description": "Modify the configuration of channel {{channel}}. Leave blank to keep current value.",
+      "selectChannel": "Select Channel",
+      "multipleChannels": "Your API Key matches multiple channels. Please select the one you want to modify.",
+      "current": "Current",
+      "noChange": "No change",
+      "newApiKeyPlaceholder": "Enter new API Key if you want to replace it",
+      "noChanges": "Please modify at least one field",
+      "invalidDisplayName": "The display name contains invisible characters or is too long. Please revise it."
+    },
+    "fields": {
+      "providerName": "Provider Name",
+      "providerUrl": "Website URL",
+      "channelName": "Channel Name",
+      "category": "Category",
+      "sponsorLevel": "Sponsor Level",
+      "baseUrl": "API Base URL",
+      "newApiKey": "New API Key"
+    },
+    "test": {
+      "title": "Connectivity Test",
+      "description": "You modified monitoring-related fields. A connectivity test is required before submission.",
+      "testType": "Service Type",
+      "variant": "Request Template",
+      "run": "Run Test",
+      "running": "Testing, please wait...",
+      "passed": "Test Passed",
+      "failed": "Test Failed",
+      "latency": "Latency",
+      "retry": "Retry Test",
+      "requestFailed": "Test request failed",
+      "proofExpired": "Test proof expired, please re-run the test"
+    },
+    "review": {
+      "title": "Confirm Changes",
+      "description": "Please review the changes below before submitting",
+      "target": "Target Channel",
+      "submit": "Submit Changes",
+      "submitFailed": "Submission failed",
+      "noCheatConfirm": "I have read and confirm the anti-cheat clause above",
+      "noCheatRequired": "Please confirm the anti-cheat clause before changing the base URL or API key"
+    },
+    "done": {
+      "title": "Change Request Submitted",
+      "description": "Your change request has been submitted. Save the ID below and provide it when you contact the admin.",
+      "newRequest": "Submit Another Request"
+    }
   },
   "admin": {
     "meta": {
@@ -342,6 +659,9 @@
       "monitors": "Monitors",
       "changes": "Changes"
     },
+    "submissions": {
+      "searchPlaceholder": "Search by application ID (first 8 chars or full UUID)"
+    },
     "monitors": {
       "backToList": "← Back to list",
       "parentChannel": "Parent Channel",
@@ -350,6 +670,8 @@
       "noChildren": "No child channels",
       "addChild": "Add Child",
       "removeChild": "Remove",
+      "childToggleBlockedByParent": "The parent channel is disabled; per-model switches take effect only after it is re-enabled.",
+      "removeChildWarning": "Remove (permanently orphans this model’s monitoring history — use \"Disable\" to pause it instead)",
       "enable": "Enable",
       "disable": "Disable",
       "show": "Show",
@@ -359,7 +681,10 @@
       "copyKey": "Copy API Key",
       "copiedKey": "Copied",
       "probe": "Probe",
+      "probeResponseBody": "Response body",
       "probing": "Probing...",
+      "probeTargetPending": "Target channel config is not active yet. Save and retry after hot-reload.",
+      "viaProxy": "via proxy",
       "templateDirtyHint": "Save monitor before testing template changes (base_url / api_key can be overridden inline)",
       "tabs": {
         "detail": "Detail",
@@ -391,7 +716,7 @@
       "confirmArchive": "Confirm archive?",
       "confirmYes": "Confirm",
       "create": "New Monitor",
-      "searchPlaceholder": "Search provider / service / channel...",
+      "searchPlaceholder": "Search provider / channel / model / domain; separate words with spaces...",
       "allBoards": "All Boards",
       "allStatus": "All Status",
       "statusActive": "Active",
@@ -448,6 +773,8 @@
         "sponsorLevel": "Sponsor Level",
         "keyType": "Key Type",
         "board": "Board",
+        "coldReason": "Cold Reason",
+        "coldReasonPlaceholder": "e.g. Long-term outage (publicly visible)",
         "interval": "Interval",
         "model": "Model",
         "apiKey": "API Key",
@@ -459,7 +786,8 @@
         "autoColdExempt": "Exempt from Auto-Cold",
         "autoColdExemptHint": "Clears and prevents the system from auto-moving this channel to the cold board",
         "autoMoveExempt": "Exempt from Auto-Move",
-        "autoMoveExemptHint": "Skips all availability-based auto-moves (expiry demotion is unaffected)"
+        "autoMoveExemptHint": "Skips all availability-based auto-moves (expiry demotion is unaffected)",
+        "modelVendor": "Model vendor"
       },
       "form": {
         "title": "New Monitor",
@@ -468,7 +796,8 @@
         "attributes": "Attributes",
         "childChannels": "Child Channels (Multi-Model)",
         "childHint": "Add child channels to monitor multiple models on the same PSC. Children inherit parent config.",
-        "modelPlaceholder": "Leave empty to use template default",
+        "modelPlaceholder": "Leave empty to follow template (changing breaks history)",
+        "modelKeyWarning": "Note: \"Model\" is the business key of this row's history series, not the model ID sent upstream. Leave it empty to follow the template; setting or changing it breaks this row's existing history.",
         "requiredFields": "Provider, Service, and Channel are required",
         "create": "Create"
       }
@@ -493,7 +822,31 @@
       "delete": "Delete",
       "confirmDelete": "Delete this change request?",
       "proposedChanges": "Proposed Changes",
+      "adminEdit": "Admin Edit",
+      "readOnly": "Read-only",
       "currentSnapshot": "Current Snapshot",
+      "liveUnavailable": {
+        "manual": "Channel is in manual mode; showing submission snapshot",
+        "deleted": "Channel no longer exists; showing submission snapshot",
+        "error": "Failed to read current config; showing submission snapshot"
+      },
+      "editElsewhereHint": "To adjust other channel fields, go to Monitor Management",
+      "colField": "Field",
+      "colCurrent": "Current",
+      "colProposed": "Proposed",
+      "fields": {
+        "provider_name": "Provider Name",
+        "provider_url": "Website URL",
+        "website_url": "Website URL",
+        "channel_name": "Channel Name",
+        "category": "Category",
+        "sponsor_level": "Sponsor Level",
+        "listed_since": "Listed Since",
+        "expires_at": "Expires At",
+        "price_min": "Min Price",
+        "price_max": "Max Price",
+        "base_url": "API Base URL"
+      },
       "testInfo": "Test Info",
       "testType": "Service Type",
       "testVariant": "Request Template",
@@ -504,7 +857,10 @@
       "adminNote": "Admin Note",
       "adminNotePlaceholder": "Enter review note...",
       "rejectNotePlaceholder": "Enter rejection reason...",
-      "confirmReject": "Confirm Reject"
+      "confirmReject": "Confirm Reject",
+      "antiCheatNA": "Anti-cheat clause: N/A (no monitoring-related field changed)",
+      "antiCheatConfirmed": "Anti-cheat clause: confirmed",
+      "antiCheatMissing": "Anti-cheat clause: not confirmed"
     },
     "detail": {
       "back": "Back to list",
@@ -526,7 +882,17 @@
       "sponsorLevel": "Sponsor Level",
       "channelType": "Channel Type",
       "channelSource": "Channel Source",
+      "channelGroup": "Channel Group Code",
       "channelName": "Channel Display Name",
+      "expiresAt": "Expires At",
+      "targetProvider": "Provider Override",
+      "targetProviderHint": "Machine code; blank derives it from the provider name",
+      "targetService": "Service Override",
+      "targetServiceHint": "Machine code; leave blank to use the derived value",
+      "targetChannel": "Channel Override",
+      "targetChannelHint": "Machine code; leave blank to use the derived value",
+      "suggestedChannel": "Suggested",
+      "pscOverrideInvalid": "This is the URL code, not a display name: lowercase letters, digits and hyphens only, no leading/trailing hyphen and no consecutive hyphens, max 100 characters",
       "listedSince": "Listed Since",
       "priceMin": "Min Price Ratio",
       "priceMax": "Max Price Ratio",
@@ -548,13 +914,46 @@
       "testing": "Testing...",
       "testResult": "Test Result",
       "subStatus": "Sub Status",
+      "testCurl": "Request curl",
+      "testCurlCopy": "Copy",
+      "testCurlCopyWithKey": "Copy with key",
+      "testCurlKeyHint": "Defaults to a $RP_API_KEY placeholder that is safe to share; \"Copy with key\" injects the real key for a ready-to-run command.",
       "publish": "Publish",
       "reject": "Reject",
       "rejectNotePlaceholder": "Enter rejection reason...",
       "confirmReject": "Confirm Reject",
       "delete": "Delete",
       "confirmDelete": "Confirm Delete",
-      "cancel": "Cancel"
+      "cancel": "Cancel",
+      "model": "Row-level model ID",
+      "modelVendor": "Model vendor"
     }
+  },
+  "vendors": {
+    "anthropic": "Anthropic",
+    "openai": "OpenAI",
+    "google": "Google",
+    "bytedance": "ByteDance",
+    "zhipu": "Zhipu AI",
+    "moonshot": "Moonshot AI",
+    "minimax": "MiniMax",
+    "deepseek": "DeepSeek",
+    "qwen": "Qwen",
+    "grok": "Grok",
+    "agnes": "Agnes"
+  },
+  "modelFamilies": {
+    "opus": "Opus",
+    "sonnet": "Sonnet",
+    "haiku": "Haiku",
+    "fable": "Fable",
+    "gpt": "GPT",
+    "gemini": "Gemini",
+    "deepseek": "DeepSeek",
+    "doubao": "Doubao",
+    "glm": "GLM",
+    "kimi": "Kimi",
+    "minimax": "MiniMax",
+    "other": "Other"
   }
 }

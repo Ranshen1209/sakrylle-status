@@ -77,6 +77,7 @@ func (s *MonitorStore) findExistingPath(key string) (string, error) {
 // MonitorSummary 是列表 API 返回的精简摘要。
 type MonitorSummary struct {
 	Key         string `json:"key"`
+	ChannelID   string `json:"channel_id,omitempty"` // 通道稳定 id（跨产品 join 锚，供 rpdiag sampler 发现）
 	Provider    string `json:"provider"`
 	Service     string `json:"service"`
 	Channel     string `json:"channel"`
@@ -95,6 +96,11 @@ type MonitorSummary struct {
 	// 由 api 层在 List 之后注入；store.List 本身不填充（store 层不依赖 storage / runtime config）。
 	// nil 表示没有任何探测记录（新创建或刚归档的通道）。
 	LatestProbe *LatestProbeSnapshot `json:"latest_probe,omitempty"`
+
+	// SearchFields 是管理后台列表搜索的匹配语料：标识与显示名、模板、base_url，
+	// 以及文件内所有层的 model / request_model（模板提供的模型名由 api 层从运行时配置补）。
+	// 只供服务端过滤，不下发。
+	SearchFields []string `json:"-"`
 }
 
 // LatestProbeSnapshot 列表页"列表活化"用的最新探测快照。
@@ -105,6 +111,20 @@ type LatestProbeSnapshot struct {
 	Latency   int    `json:"latency"`         // ms
 	Timestamp int64  `json:"timestamp"`       // Unix 秒
 	Model     string `json:"model,omitempty"` // 这条记录归属的 model（多 model 通道用得着）
+}
+
+// RootMonitor 返回监测文件的父通道（无 parent 字段者）。
+// 空文件返回 nil。文件中父通道未必排在 Monitors[0]，故须遍历。
+func RootMonitor(mf *MonitorFile) *ServiceConfig {
+	if mf == nil || len(mf.Monitors) == 0 {
+		return nil
+	}
+	for i := range mf.Monitors {
+		if strings.TrimSpace(mf.Monitors[i].Parent) == "" {
+			return &mf.Monitors[i]
+		}
+	}
+	return &mf.Monitors[0]
 }
 
 // List 列出 monitors.d/ 下所有监测文件的摘要。
@@ -120,17 +140,15 @@ func (s *MonitorStore) List() ([]MonitorSummary, error) {
 			continue
 		}
 
-		root := f.Monitors[0]
-		// 找到父通道（无 parent 字段的那个）
-		for _, m := range f.Monitors {
-			if strings.TrimSpace(m.Parent) == "" {
-				root = m
-				break
-			}
+		rootPtr := RootMonitor(&f)
+		if rootPtr == nil {
+			continue
 		}
+		root := *rootPtr
 
 		summaries = append(summaries, MonitorSummary{
 			Key:         f.Key,
+			ChannelID:   f.Metadata.ChannelID,
 			Provider:    root.Provider,
 			Service:     root.Service,
 			Channel:     root.Channel,
@@ -144,9 +162,28 @@ func (s *MonitorStore) List() ([]MonitorSummary, error) {
 			Source:      f.Metadata.Source,
 			Revision:    f.Metadata.Revision,
 			UpdatedAt:   f.Metadata.UpdatedAt,
+
+			SearchFields: monitorSearchFields(f, root),
 		})
 	}
 	return summaries, nil
+}
+
+// monitorSearchFields 收集一个监测文件可被搜索命中的字段。列表只展示父通道，
+// 但管理员常按子通道的模型名或 base_url 找通道，所以各层都要收进来。
+func monitorSearchFields(f MonitorFile, root ServiceConfig) []string {
+	// 不收 key（provider--service--channel 拼接，归一化后会跨字段凑出假命中）和
+	// channel_id（随机 uuid，短词会随机撞上）。
+	fields := []string{
+		root.Provider, root.ProviderName,
+		root.Service, root.ServiceName,
+		root.Channel, root.ChannelName,
+		root.Template,
+	}
+	for _, m := range f.Monitors {
+		fields = append(fields, m.Model, m.RequestModel, m.BaseURL)
+	}
+	return fields
 }
 
 // Get 读取指定 key 的监测文件。key 格式: provider--service--channel
@@ -205,6 +242,23 @@ func (s *MonitorStore) Create(file *MonitorFile) error {
 	}
 	file.Metadata.UpdatedAt = now
 
+	// 生成缺失的稳定 id（幂等：已有则不动）。与回填 CLI 共用同一生成逻辑。
+	BackfillFileIDs(file)
+
+	// cold_reason 收敛到 loader 口径，避免非 cold 板位的行把原因文案带上磁盘。
+	normalizeColdReasons(file)
+
+	// 写盘前 fail-loud：payload 自带的重复 model_id 不会被 BackfillFileIDs 覆盖，
+	// 落盘即造出一份 loader 拒绝加载的坏文件。
+	if err := ValidateFileModelIDsUnique(file); err != nil {
+		return err
+	}
+
+	// 写盘前 fail-loud：撞展示名的文件落盘后会让 loader 整份拒载（重启即起不来）。
+	if err := s.checkDisplayNameConflict(path, file); err != nil {
+		return err
+	}
+
 	if err := AtomicWriteYAML(path, file); err != nil {
 		return err
 	}
@@ -214,9 +268,13 @@ func (s *MonitorStore) Create(file *MonitorFile) error {
 	return nil
 }
 
-// preserveAdminHiddenFields 将 json:"-" 字段从 existing 合并到 updated。
-// 这些字段不参与 admin API JSON round-trip，PUT 更新时必须从磁盘文件回填。
+// preserveAdminHiddenFields 把 admin PUT 不应改写的持久化字段从 existing 合并到 updated：
+// 既含不参与 JSON round-trip 的 json:"-" 字段，也含对客户端可见但系统维护、不可变的稳定 id。
 func preserveAdminHiddenFields(updated, existing *MonitorFile) {
+	// channel_id 文件级不可变：先无条件从 existing 还原，防止 admin PUT 篡改；legacy 空值由
+	// 调用方 Update 在写盘前的 BackfillFileIDs 自动补齐（不再依赖手动跑回填 CLI）。
+	updated.Metadata.ChannelID = existing.Metadata.ChannelID
+
 	// root 对 root
 	updatedRoot := findRootMonitor(updated.Monitors)
 	existingRoot := findRootMonitor(existing.Monitors)
@@ -224,23 +282,70 @@ func preserveAdminHiddenFields(updated, existing *MonitorFile) {
 		copyAdminHiddenFields(updatedRoot, existingRoot)
 	}
 
-	// child 按 parent+model 匹配
-	existingChildren := make(map[string]*ServiceConfig, len(existing.Monitors))
-	for i := range existing.Monitors {
-		if strings.TrimSpace(existing.Monitors[i].Parent) == "" {
-			continue
-		}
-		existingChildren[childMatchKey(existing.Monitors[i])] = &existing.Monitors[i]
-	}
+	// child 按双通道匹配：model_id 优先，展示名兜底（zero regression for legacy children without id）。
+	//
+	// **匹配必须一对一**：既有子行一旦被某个 updated 行认领即移出候选，后续行匹配不到就
+	// 走 BackfillFileIDs 铸新 id。多对一会直接造出重复 model_id——模板驱动的子行展示名来自
+	// 模板、行里不写 model，磁盘上 model 是空串，于是新加的空 model 子行会集体命中同一个既有
+	// 子行、被 copyAdminHiddenFields 复制走同一个 id，写出一份 loader 拒绝加载的坏文件
+	// （admin 返回 200、热更新 fail-closed 保住旧配置，但容器重启即崩）。
+	//
+	// 两个 pass 是两个完整循环而非行内二级 fallback：保证**全局** model_id 匹配优先于展示名
+	// 兜底，否则排在前面的无 id 行可能先按展示名抢走某个既有行，而后面本该按 id 配到它的行
+	// 反倒落空。代价是 updated 数组顺序不再决定 id/展示名冲突时的归属——稳定 id 恒胜出。
+	//
+	// 子行数量是个位数，线性扫描（O(U×E)）比双索引队列更易审计，且两个 pass 天然共享同一份
+	// 认领状态。
+	claimed := make([]bool, len(existing.Monitors))
+	matched := make([]bool, len(updated.Monitors))
+
+	// Pass 1: 按 model_id 匹配（跨展示名改名保留 hidden fields）
 	for i := range updated.Monitors {
 		if strings.TrimSpace(updated.Monitors[i].Parent) == "" {
 			continue
 		}
-		if src, ok := existingChildren[childMatchKey(updated.Monitors[i])]; ok {
+		key, ok := childMatchKeyByModelID(updated.Monitors[i])
+		if !ok {
+			continue
+		}
+		if src := claimExistingChild(existing.Monitors, claimed, func(m ServiceConfig) bool {
+			existingKey, ok := childMatchKeyByModelID(m)
+			return ok && existingKey == key
+		}); src != nil {
+			copyAdminHiddenFields(&updated.Monitors[i], src)
+			matched[i] = true
+		}
+	}
+
+	// Pass 2: 按展示名匹配（legacy 无 id / id 未命中时的兜底）
+	for i := range updated.Monitors {
+		if matched[i] || strings.TrimSpace(updated.Monitors[i].Parent) == "" {
+			continue
+		}
+		key := childMatchKeyByModel(updated.Monitors[i])
+		if src := claimExistingChild(existing.Monitors, claimed, func(m ServiceConfig) bool {
+			return childMatchKeyByModel(m) == key
+		}); src != nil {
 			copyAdminHiddenFields(&updated.Monitors[i], src)
 		}
-		// 新增 child（无匹配）不继承，删除 child（不在 updated 中）自然消失
 	}
+	// 新增 child（无匹配）不继承，删除 child（不在 updated 中）自然消失
+}
+
+// claimExistingChild 返回第一个满足 match 且尚未被认领的既有子行，并就地标记为已认领；
+// 无候选时返回 nil。按 existing 的文件顺序扫描，使同键多行的分配结果确定可复现。
+func claimExistingChild(existing []ServiceConfig, claimed []bool, match func(ServiceConfig) bool) *ServiceConfig {
+	for j := range existing {
+		if claimed[j] || strings.TrimSpace(existing[j].Parent) == "" {
+			continue
+		}
+		if !match(existing[j]) {
+			continue
+		}
+		claimed[j] = true
+		return &existing[j]
+	}
+	return nil
 }
 
 // findRootMonitor 返回第一个无 parent 字段的监测项指针。
@@ -253,14 +358,54 @@ func findRootMonitor(monitors []ServiceConfig) *ServiceConfig {
 	return nil
 }
 
-// childMatchKey 生成子通道匹配键：parent + NUL + model。
-func childMatchKey(m ServiceConfig) string {
+// normalizeColdReasons 写盘前把 cold_reason 收敛到与 loader 同一口径：去首尾空白，
+// 且**有效板位**不是 cold 的行一律置空。有效板位 = 行自身的 board，为空则取根行的
+// （与 parent_inheritance 给子行继承 Board 的口径一致，此处文件尚未经过继承）。
+//
+// 为什么写盘也要做一遍：loader 的 normalizeMonitorsPostInheritance 已经在内存里清了同一批
+// 值，但它只清内存、不回写磁盘。于是「设冷板 → 填原因 → 改回热板」之后，yaml 里仍留着那条
+// 原因，下次再设冷板就会复活一条过期文案。规范化而非拒绝，故不影响管理员逃生口语义。
+func normalizeColdReasons(file *MonitorFile) {
+	rootBoard := ""
+	if root := findRootMonitor(file.Monitors); root != nil {
+		rootBoard = strings.TrimSpace(root.Board)
+	}
+	for i := range file.Monitors {
+		m := &file.Monitors[i]
+		m.ColdReason = strings.TrimSpace(m.ColdReason)
+		if m.ColdReason == "" {
+			continue
+		}
+		board := strings.TrimSpace(m.Board)
+		if board == "" {
+			board = rootBoard
+		}
+		if board != "cold" {
+			m.ColdReason = ""
+		}
+	}
+}
+
+// childMatchKeyByModelID 返回按 parent+model_id 的稳定匹配键。
+// model_id 为空时 ok=false，调用方应回退到展示名匹配。
+func childMatchKeyByModelID(m ServiceConfig) (string, bool) {
+	id := strings.TrimSpace(m.ModelID)
+	if id == "" {
+		return "", false
+	}
+	return strings.TrimSpace(m.Parent) + "\x00" + id, true
+}
+
+// childMatchKeyByModel 返回按 parent+展示名 的匹配键（legacy 兜底）。
+func childMatchKeyByModel(m ServiceConfig) string {
 	return strings.TrimSpace(m.Parent) + "\x00" + strings.TrimSpace(m.Model)
 }
 
-// copyAdminHiddenFields 将 src 的 json:"-" 持久化字段复制到 dst。
+// copyAdminHiddenFields 把 src 中 admin PUT 不应改写的监测行字段复制到 dst：
+// 含 json:"-" 持久化字段，以及对客户端可见但不可变的 model_id（强制从 existing 还原以保证 id 不可变）。
 // 注意：KeyType 和 AutoColdExempt 已改为 JSON 可见字段，通过 API round-trip 传递，无需在此回填。
 func copyAdminHiddenFields(dst, src *ServiceConfig) {
+	dst.ModelID = src.ModelID
 	dst.EnvVarName = src.EnvVarName
 	dst.RequestModel = src.RequestModel
 	dst.SkipURLValidation = src.SkipURLValidation
@@ -309,8 +454,25 @@ func (s *MonitorStore) Update(key string, file *MonitorFile, expectedRevision in
 		return fmt.Errorf("PSC 不可变更: %s -> %s", key, newKey)
 	}
 
-	// 回填 json:"-" 字段，防止 admin API round-trip 丢失
+	// 回填 json:"-" 字段与既有稳定 id（按 parent+model_id/展示名匹配），防止 admin API round-trip 丢失。
 	preserveAdminHiddenFields(file, &existing)
+
+	// 给仍缺失稳定 id 的行铸新 id（真新增的父/子行，或 legacy 空 id）；与 Create / 回填 CLI
+	// 共用同一幂等逻辑，已有 id 绝不覆盖。缺这步时，经 admin 编辑新增的子通道行会无 model_id，
+	// 触发 CheckRuntimeModelIDs fail-closed 跳过整份配置热更新（admin 保存返回 200，运行态却静默不变）。
+	BackfillFileIDs(file)
+
+	// cold_reason 收敛到 loader 口径（含把改回热板后残留的旧原因清掉）。
+	normalizeColdReasons(file)
+
+	// 写盘前 fail-loud：一对一合并已杜绝"复制既有 id"，但 payload 自带的重复 id 仍会原样落盘。
+	// 拒绝时磁盘文件与 revision 均不改动。
+	if err := ValidateFileModelIDsUnique(file); err != nil {
+		return err
+	}
+	if err := s.checkDisplayNameConflict(path, file); err != nil {
+		return err
+	}
 
 	file.Metadata.Revision = expectedRevision + 1
 	file.Metadata.CreatedAt = existing.Metadata.CreatedAt // 保留创建时间

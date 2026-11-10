@@ -1,19 +1,25 @@
 import { useState, useCallback, useRef, useEffect, useMemo } from 'react';
+import { useDrawingColumnPreference } from '../hooks/useDrawingColumnPreference';
 import { useLocation, useParams, useSearchParams } from 'react-router-dom';
 import { Helmet } from 'react-helmet-async';
 import { useTranslation } from 'react-i18next';
 import { Server } from 'lucide-react';
-import { useMonitorData } from '../features/status/hooks/useMonitorData';
-import { useFavorites } from '../features/status/hooks/useFavorites';
+import { useMonitorData } from '../hooks/useMonitorData';
+import { useRpdiagScores } from '../hooks/useRpdiagScores';
+import { useFavorites } from '../hooks/useFavorites';
 import { useSeoMeta } from '../hooks/useSeoMeta';
 import { Header } from '../components/Header';
-import { Controls } from '../features/status/components/Controls';
-import { StatusTable } from '../features/status/components/StatusTable';
-import { StatusCard } from '../features/status/components/StatusCard';
+import { Controls } from '../components/Controls';
+import { StatusTable } from '../components/StatusTable';
+import { StatusCard } from '../components/StatusCard';
+import { vendorLabel } from '../components/VendorBadge';
 import { Tooltip } from '../components/Tooltip';
 import { EmptyFavorites } from '../components/EmptyFavorites';
-import { createMediaQueryEffect } from '../utils/mediaQuery';
-import { canonicalize } from '../features/status/utils/monitorDataProcessor';
+import { useBreakpointMatch } from '../hooks/useBreakpoint';
+import { canonicalize } from '../utils/monitorDataProcessor';
+import { modelFamilyLabel } from '../utils/modelFamily';
+import { buildModelOptions, matchesModelKeys } from '../utils/modelFilter';
+import type { MultiSelectOption } from '../components/MultiSelect';
 import type { ViewMode, SortConfig, TooltipState, ProcessedMonitorData, ChannelOption, BoardFilter } from '../types';
 
 // localStorage key for time align preference (shared with App.tsx)
@@ -28,6 +34,42 @@ interface ProviderPageSnapshot {
   version: 1;
   filterService: string[];
   filterChannel: string[];
+  /** 2026-08 加入的厂商筛选。**故意留在 version 1**：旧会话快照没有这个键，
+   *  升 version 会让那份快照整体作废。解析时缺失降级为空数组，见 parseProviderPageSnapshot。 */
+  filterVendor: string[];
+  /** 2026-09 加入的模型筛选。理由同 filterVendor：**故意留在 version 1**，
+   *  缺失即降级成空数组，不让旧快照整份作废。 */
+  filterModel: string[];
+}
+
+/** 解析 ProviderPage 收藏模式快照：结构不对返回 null；仅后加的 filterVendor /
+ *  filterModel 允许缺失。 */
+function parseProviderPageSnapshot(raw: string | null): ProviderPageSnapshot | null {
+  if (!raw) return null;
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(raw);
+  } catch {
+    return null;
+  }
+  if (typeof parsed !== 'object' || parsed === null) return null;
+  const candidate = parsed as Record<string, unknown>;
+  if (candidate.version !== 1) return null;
+
+  const asStringArray = (value: unknown): string[] | null =>
+    Array.isArray(value) && value.every((v) => typeof v === 'string') ? value : null;
+
+  const filterService = asStringArray(candidate.filterService);
+  const filterChannel = asStringArray(candidate.filterChannel);
+  if (!filterService || !filterChannel) return null;
+
+  return {
+    version: 1,
+    filterService,
+    filterChannel,
+    filterVendor: asStringArray(candidate.filterVendor) ?? [],
+    filterModel: asStringArray(candidate.filterModel) ?? [],
+  };
 }
 
 /**
@@ -69,6 +111,8 @@ export default function ProviderPage() {
   const [timeFilter, setTimeFilter] = useState<string | null>(null);
   const [filterService, setFilterService] = useState<string[]>([]);
   const [filterChannel, setFilterChannel] = useState<string[]>([]);
+  const [filterVendor, setFilterVendor] = useState<string[]>([]);
+  const [filterModel, setFilterModel] = useState<string[]>([]);
   // filterCategory 在 Provider 页面固定为空数组（全部），不需要状态
   const [viewMode, setViewMode] = useState<ViewMode>('table');
   const [sortConfig, setSortConfig] = useState<SortConfig>({
@@ -112,16 +156,15 @@ export default function ProviderPage() {
   const { favorites, isFavorite, toggleFavorite, cleanupMissingFavorites, count: favoritesCount } = useFavorites();
   const [showFavoritesOnly, setShowFavoritesOnly] = useState(false);
 
-  // 移动端检测（< 960px）
-  const [isMobile, setIsMobile] = useState(false);
-  useEffect(() => {
-    const cleanup = createMediaQueryEffect('tablet', setIsMobile);
-    return cleanup;
-  }, []);
+  // 平板及以下（tablet 断点 = max-width:1023px）
+  const isMobile = useBreakpointMatch('tablet');
+
+  // rpdiag 质量分（异步），用于 sort 前给项目注入 qualityScore，并驱动质量列排序可用性
+  const { scores: rpdiagScores, loaded: rpdiagScoresLoaded } = useRpdiagScores();
 
   // 数据获取 - 先获取全部数据用于构建映射
   // Provider 页面不启用置顶功能（isInitialSort=false）
-  const { data: allData, loading, error, stats, slowLatencyMs, enableAnnotations, boardsEnabled, boardsEnabledLoaded, allMonitorIds, allMonitorIdsSupported, refetch } = useMonitorData({
+  const { data: allData, rawData, loading, error, stats, slowLatencyMs, enableAnnotations, boardsEnabled, boardsEnabledLoaded, allMonitorIds, allMonitorIdsSupported, hidePriceColumn, hideVendorFilter, effectiveFilterVendor, rpdiagEnabled, hideDrawingColumn, refetch } = useMonitorData({
     timeRange,
     timeAlign,
     timeFilter,
@@ -130,11 +173,31 @@ export default function ProviderPage() {
     filterProvider: [], // 空数组表示全部
     filterChannel,
     filterCategory: [], // Provider页面不筛选分类，空数组表示全部
+    filterVendor,
+    filterModel,
     sortConfig,
     isInitialSort: false, // Provider页面禁用置顶
     // 冷板数据不更新，禁用自动刷新以节省资源
     autoRefresh: board !== 'cold',
+    rpdiagScores,
+    rpdiagScoresLoaded,
   });
+  // 画作列：rpdiag 启用且站点没关时才有这一列，访客可再自行关掉
+  const { showDrawings, toggleDrawings } = useDrawingColumnPreference();
+  const drawingColumnAvailable = rpdiagEnabled && !hideDrawingColumn;
+
+  // 运行时隐藏价格列后，若本地 sortConfig 还停留在 priceRatio，
+  // 则退回默认排序，避免 UI 上"按隐藏列排序"的语义错位（局部状态，无 URL 干扰）。
+  // 渲染期条件 setState（非 effect）：纠偏后 sortConfig.key 变 uptime，下一轮条件即假、自然收敛，
+  // 不会级联循环（React 官方"渲染期调整 state"配方，比 effect 少一次提交后重渲染）。
+  if (hidePriceColumn && sortConfig.key === 'priceRatio') {
+    setSortConfig({ key: 'uptime', direction: 'desc' });
+  }
+
+  // 同理：rpdiag 关闭（私有部署）后质量列消失，本地 sortConfig 若停在 qualityScore 则退回默认。
+  if (!rpdiagEnabled && sortConfig.key === 'qualityScore') {
+    setSortConfig({ key: 'uptime', direction: 'desc' });
+  }
 
   // 板块功能禁用时，自动归一 board 到 hot
   // 解决：用户手动输入 ?board=cold 但功能未启用时的 URL 混乱问题
@@ -172,9 +235,12 @@ export default function ProviderPage() {
     cleanupMissingFavorites(allMonitorIds);
   }, [loading, error, allMonitorIds, allMonitorIdsSupported, favorites.size, cleanupMissingFavorites]);
 
-  // 构建 slug -> providerId 映射
+  // 构建 slug -> providerId 映射。
+  // ⚠️ 必须用 rawData（未过筛选器）而不是 allData：筛选条件把本页数据筛空时，
+  // 映射会是空的，realProviderId 便回落成 slug 字符串，后面按 providerId 过滤
+  // 就再也匹配不上——清掉筛选也回不来。
   const slugToProviderId = new Map<string, string>();
-  allData.forEach((item) => {
+  rawData.forEach((item) => {
     slugToProviderId.set(item.providerSlug, item.providerId);
   });
 
@@ -190,6 +256,8 @@ export default function ProviderPage() {
     showFavoritesOnly,
     filterService.length > 0,
     filterChannel.length > 0,
+    effectiveFilterVendor.length > 0,
+    filterModel.length > 0,
   ].filter(Boolean).length;
 
   // 基础数据：应用收藏筛选后的数据（如适用）
@@ -197,6 +265,15 @@ export default function ProviderPage() {
     if (!showFavoritesOnly) return data;
     return data.filter(item => favorites.has(item.id));
   }, [data, showFavoritesOnly, favorites]);
+
+  // 选项基础数据：本 provider 的**未经筛选**数据（rawData 未过任何筛选器），
+  // 用于计算 effectiveXxx —— 与 App 的 optionsBaseData 同一范式。
+  // 不能用 baseData：它来自 useMonitorData 已按 service/channel/vendor 筛过的结果，
+  // 拿它算选项等于「选了 cc 之后下拉里就只剩 cc」，用户没法再多选一个 cx。
+  const optionsBaseData = useMemo(() => {
+    const mine = rawData.filter(item => item.providerId === realProviderId);
+    return showFavoritesOnly ? mine.filter(item => favorites.has(item.id)) : mine;
+  }, [rawData, realProviderId, showFavoritesOnly, favorites]);
 
   // 最终过滤后的数据（应用所有筛选器）
   const filteredData = useMemo(() => {
@@ -207,25 +284,48 @@ export default function ProviderPage() {
     if (filterChannel.length > 0) {
       filtered = filtered.filter(item => item.channel && filterChannel.includes(item.channel));
     }
+    if (effectiveFilterVendor.length > 0) {
+      // 未声明厂商的通道在厂商筛选生效时排除（与 useMonitorData 口径一致）
+      filtered = filtered.filter(item => item.modelVendors?.some(v => effectiveFilterVendor.includes(v)));
+    }
+    if (filterModel.length > 0) {
+      // 模型是 any 语义：任一 layer 命中即保留整条通道（口径同首页）
+      const modelSet = new Set(filterModel);
+      filtered = filtered.filter(item => matchesModelKeys(item.modelEntries, modelSet));
+    }
     return filtered;
-  }, [baseData, filterService, filterChannel]);
+  }, [baseData, filterService, filterChannel, effectiveFilterVendor, filterModel]);
 
   // 动态 Service 选项：基于 channel 筛选后的数据
   const effectiveServices = useMemo(() => {
-    let filtered = baseData;
+    let filtered = optionsBaseData;
     if (filterChannel.length > 0) {
       filtered = filtered.filter(item => item.channel && filterChannel.includes(item.channel));
+    }
+    if (effectiveFilterVendor.length > 0) {
+      filtered = filtered.filter(item => item.modelVendors?.some(v => effectiveFilterVendor.includes(v)));
+    }
+    if (filterModel.length > 0) {
+      const modelSet = new Set(filterModel);
+      filtered = filtered.filter(item => matchesModelKeys(item.modelEntries, modelSet));
     }
     const set = new Set<string>();
     filtered.forEach(item => set.add(item.serviceType.toLowerCase()));
     return Array.from(set).sort();
-  }, [baseData, filterChannel]);
+  }, [optionsBaseData, filterChannel, effectiveFilterVendor, filterModel]);
 
   // 动态 Channel 选项：基于 service 筛选后的数据
   const effectiveChannels = useMemo<ChannelOption[]>(() => {
-    let filtered = baseData;
+    let filtered = optionsBaseData;
     if (filterService.length > 0) {
       filtered = filtered.filter(item => filterService.includes(item.serviceType.toLowerCase()));
+    }
+    if (effectiveFilterVendor.length > 0) {
+      filtered = filtered.filter(item => item.modelVendors?.some(v => effectiveFilterVendor.includes(v)));
+    }
+    if (filterModel.length > 0) {
+      const modelSet = new Set(filterModel);
+      filtered = filtered.filter(item => matchesModelKeys(item.modelEntries, modelSet));
     }
     // 收集 channel -> channelName 映射
     const map = new Map<string, string>();
@@ -238,7 +338,57 @@ export default function ProviderPage() {
     return Array.from(map.entries())
       .sort((a, b) => a[1].localeCompare(b[1], 'zh-CN'))
       .map(([value, label]) => ({ value, label }));
-  }, [baseData, filterService]);
+  }, [optionsBaseData, filterService, effectiveFilterVendor, filterModel]);
+
+  // 动态厂商选项：基于 service/channel 筛选后的数据（不含 vendor 自身），label 本地化后排序
+  const effectiveVendors = useMemo<MultiSelectOption[]>(() => {
+    let filtered = optionsBaseData;
+    if (filterService.length > 0) {
+      filtered = filtered.filter(item => filterService.includes(item.serviceType.toLowerCase()));
+    }
+    if (filterChannel.length > 0) {
+      filtered = filtered.filter(item => item.channel && filterChannel.includes(item.channel));
+    }
+    if (filterModel.length > 0) {
+      const modelSet = new Set(filterModel);
+      filtered = filtered.filter(item => matchesModelKeys(item.modelEntries, modelSet));
+    }
+    const set = new Set<string>();
+    filtered.forEach(item => { item.modelVendors?.forEach(v => set.add(v)); });
+    // 已选项即使被其他筛选筛没了也保持可见，否则用户取消不掉自己选的条件
+    effectiveFilterVendor.forEach(vendor => set.add(vendor));
+    return Array.from(set)
+      .map(value => ({ value, label: vendorLabel(t, value) }))
+      .sort((a, b) => a.label.localeCompare(b.label, 'zh-CN'));
+  }, [optionsBaseData, filterService, filterChannel, effectiveFilterVendor, filterModel, t]);
+
+  // 动态模型选项：基于 service/channel/vendor 筛选后的数据（不含 model 自身）。
+  // 选项构建与首页共用 buildModelOptions——计数口径、已选保留、家族分段连续
+  // 那几条规矩都在那里，本页不再复写一份。
+  const effectiveModels = useMemo<MultiSelectOption[]>(() => {
+    let filtered = optionsBaseData;
+    if (filterService.length > 0) {
+      filtered = filtered.filter(item => filterService.includes(item.serviceType.toLowerCase()));
+    }
+    if (filterChannel.length > 0) {
+      filtered = filtered.filter(item => item.channel && filterChannel.includes(item.channel));
+    }
+    if (effectiveFilterVendor.length > 0) {
+      filtered = filtered.filter(item => item.modelVendors?.some(v => effectiveFilterVendor.includes(v)));
+    }
+    return buildModelOptions({
+      scoped: filtered,
+      all: optionsBaseData,
+      selected: filterModel,
+      familyLabel: (code) => modelFamilyLabel(t, code),
+    });
+  }, [optionsBaseData, filterService, filterChannel, effectiveFilterVendor, filterModel, t]);
+
+  // 筛选器与服务列说明只取本服务商未筛选的数据。
+  const hasVendorData = useMemo(
+    () => rawData.some(item => item.providerId === realProviderId && !!item.modelVendors?.length),
+    [rawData, realProviderId],
+  );
 
   // 收藏模式切换（ProviderPage 独立快照管理）
   const handleFavoritesModeChange = useCallback((enabled: boolean) => {
@@ -251,6 +401,8 @@ export default function ProviderPage() {
         version: 1,
         filterService,
         filterChannel,
+        filterVendor,
+        filterModel,
       };
       try {
         sessionStorage.setItem(getSnapshotKey(normalizedProvider), JSON.stringify(snapshot));
@@ -260,23 +412,16 @@ export default function ProviderPage() {
       // 清空筛选器并启用收藏模式
       setFilterService([]);
       setFilterChannel([]);
+      setFilterVendor([]);
+      setFilterModel([]);
       setShowFavoritesOnly(true);
     } else {
       // 恢复快照
       let snapshot: ProviderPageSnapshot | null = null;
       try {
-        const raw = sessionStorage.getItem(getSnapshotKey(normalizedProvider));
-        if (raw) {
-          const parsed = JSON.parse(raw);
-          // 校验快照结构
-          if (parsed?.version === 1 &&
-              Array.isArray(parsed.filterService) &&
-              Array.isArray(parsed.filterChannel)) {
-            snapshot = parsed;
-          }
-        }
+        snapshot = parseProviderPageSnapshot(sessionStorage.getItem(getSnapshotKey(normalizedProvider)));
       } catch {
-        // 解析失败时使用默认值
+        // sessionStorage 不可用时使用默认值
       }
       // 无论成功与否都清理快照
       try {
@@ -289,21 +434,30 @@ export default function ProviderPage() {
       if (snapshot) {
         setFilterService(snapshot.filterService);
         setFilterChannel(snapshot.filterChannel);
+        setFilterVendor(snapshot.filterVendor);
+        setFilterModel(snapshot.filterModel);
       } else {
         // 无快照时恢复为默认
         setFilterService([]);
         setFilterChannel([]);
+        setFilterVendor([]);
+        setFilterModel([]);
       }
       setShowFavoritesOnly(false);
     }
-  }, [normalizedProvider, filterService, filterChannel, showFavoritesOnly]);
+  }, [normalizedProvider, filterService, filterChannel, filterVendor, filterModel, showFavoritesOnly]);
 
   // 移动端强制使用 table 视图
   const effectiveViewMode = isMobile ? 'table' : viewMode;
 
   // 软 404 处理：只在 provider slug 真正不存在时返回 404
   // 避免网络错误或筛选条件导致的空数据被误判为 404
-  const providerExists = allData.some((item) => item.providerSlug === normalizedProvider);
+  //
+  // ⚠️ 判据必须是 rawData（未过筛选器）。用 allData（= useMonitorData 已应用全部
+  // 筛选器的结果）会让「筛选筛空」被当成「服务商不存在」：实测 /p/aimz 选中只有
+  // 主板才有的 gpt-5.5 后切到冷板，页面直接弹 404——而该服务商在冷板明明有通道。
+  // 筛选器状态跨 board 保留，所以这条路径很容易走到。
+  const providerExists = rawData.some((item) => item.providerSlug === normalizedProvider);
 
   if (!loading && !error && !providerExists) {
     return <ProviderNotFound providerSlug={provider || ''} isEmbedMode={isEmbedMode} />;
@@ -378,7 +532,7 @@ export default function ProviderPage() {
           </div>
         )}
 
-        <div className="relative z-10 max-w-7xl mx-auto px-4 py-4 sm:py-6 sm:px-6 lg:px-8">
+        <div className="relative z-10 max-w-[1536px] mx-auto px-4 py-4 sm:py-6 sm:px-6 lg:px-8">
         {/* 完整模式：显示 Header */}
         {!isEmbedMode && (
           <Header
@@ -393,6 +547,10 @@ export default function ProviderPage() {
 
         {/* 控制面板 - 隐藏 provider 和 category 筛选器，只显示当前 provider 的通道 */}
         <Controls
+          showVendorFilter={!hideVendorFilter}
+          filterModel={filterModel}
+          effectiveModels={effectiveModels}
+          onModelChange={setFilterModel}
           timeRange={timeRange}
           timeAlign={timeAlign}
           timeFilter={timeFilter}
@@ -402,6 +560,7 @@ export default function ProviderPage() {
           filterProvider={[]}
           filterChannel={filterChannel}
           filterCategory={[]}
+          filterVendor={effectiveFilterVendor}
           showFavoritesOnly={showFavoritesOnly}
           favorites={favorites}
           favoritesCount={effectiveFavoritesCount}
@@ -411,8 +570,10 @@ export default function ProviderPage() {
           channels={effectiveChannels} // 收藏筛选时只显示收藏项中的通道
           effectiveServices={effectiveServices}
           effectiveCategories={[]}  // ProviderPage 不显示分类筛选
+          effectiveVendors={effectiveVendors}
           showCategoryFilter={false} // 隐藏分类筛选器
           isMobile={isMobile}
+          embed={isEmbedMode} // 嵌入模式隐藏收藏/订阅/板块切换，只留刷新+视图切换
           showFilterDrawer={showFilterDrawer}
           onFilterDrawerClose={() => setShowFilterDrawer(false)}
           onTimeRangeChange={setTimeRange}
@@ -423,8 +584,11 @@ export default function ProviderPage() {
           onProviderChange={() => {}} // 无操作
           onChannelChange={setFilterChannel}
           onCategoryChange={() => {}} // 无操作
+          onVendorChange={setFilterVendor}
           onShowFavoritesOnlyChange={handleFavoritesModeChange}
           onViewModeChange={setViewMode}
+          showDrawings={showDrawings}
+          onToggleDrawings={drawingColumnAvailable ? toggleDrawings : undefined}
           onRefresh={handleRefresh}
           refreshCooldown={refreshCooldown}
         />
@@ -465,8 +629,7 @@ export default function ProviderPage() {
                   sortConfig={sortConfig}
                   timeRange={timeRange}
                   slowLatencyMs={slowLatencyMs}
-                  enableAnnotations={enableAnnotations}
-                  showCategoryTag={false}
+                  enableAnnotations={isEmbedMode ? false : enableAnnotations}
                   showProvider={!isEmbedMode}
                   showSponsor={false}
                   isFavorite={isFavorite}
@@ -474,6 +637,12 @@ export default function ProviderPage() {
                   onSort={handleSort}
                   onBlockHover={handleBlockHover}
                   onBlockLeave={handleBlockLeave}
+                  rpdiagScores={rpdiagScores}
+                  rpdiagScoresLoaded={rpdiagScoresLoaded}
+                  rpdiagEnabled={rpdiagEnabled}
+                  hidePriceColumn={hidePriceColumn}
+                  hasVendorData={hasVendorData}
+                  showDrawingColumn={drawingColumnAvailable && showDrawings && !isEmbedMode}
                 />
               )}
 
@@ -485,10 +654,11 @@ export default function ProviderPage() {
                       item={item}
                       timeRange={timeRange}
                       slowLatencyMs={slowLatencyMs}
-                      enableAnnotations={enableAnnotations}
-                      showCategoryTag={false}
+                      enableAnnotations={isEmbedMode ? false : enableAnnotations}
+                      showProvider={!isEmbedMode}
                       isFavorite={isFavorite}
                       onToggleFavorite={toggleFavorite}
+                      hidePriceColumn={hidePriceColumn}
                       onBlockHover={handleBlockHover}
                       onBlockLeave={handleBlockLeave}
                     />

@@ -14,7 +14,21 @@ import (
 	"monitor/internal/config"
 	"monitor/internal/logger"
 	"monitor/internal/onboarding"
+	"monitor/internal/probe"
 )
+
+// buildLikePattern 把用户输入转成可安全用于 SQL LIKE 的模式串。
+// 先用 '!' 作为转义字符把 LIKE 元字符（! % _）转义，再用 % 包裹实现子串模糊匹配。
+// 对应的 SQL 须声明 ESCAPE '!'。返回空串表示无搜索条件。
+func buildLikePattern(raw string) string {
+	if raw == "" {
+		return ""
+	}
+	escaped := strings.ReplaceAll(raw, "!", "!!")
+	escaped = strings.ReplaceAll(escaped, "%", "!%")
+	escaped = strings.ReplaceAll(escaped, "_", "!_")
+	return "%" + escaped + "%"
+}
 
 // checkAdminToken 验证管理员 Bearer token。
 // 返回 true 表示验证通过，false 表示已返回错误响应。
@@ -40,10 +54,21 @@ func (h *Handler) checkAdminToken(c *gin.Context) bool {
 		return false
 	}
 
+	// 只对 token 比对失败计数（缺头/格式错猜不到任何东西）：比对前先扣一个令牌、成功再退回，
+	// 见 authFailureLimiter 的说明。耗尽后该 IP 连正确 token 也先拒。
+	ip := c.ClientIP()
+	if h.adminAuthLimiter != nil && !h.adminAuthLimiter.acquire(ip) {
+		apiError(c, http.StatusTooManyRequests, ErrCodeRateLimited, "鉴权失败次数过多，请稍后再试")
+		return false
+	}
+
 	token := strings.TrimPrefix(authHeader, bearerPrefix)
 	if subtle.ConstantTimeCompare([]byte(token), []byte(adminToken)) != 1 {
 		apiError(c, http.StatusForbidden, ErrCodeForbidden, "管理员 token 无效")
 		return false
+	}
+	if h.adminAuthLimiter != nil {
+		h.adminAuthLimiter.refund(ip)
 	}
 
 	return true
@@ -69,7 +94,10 @@ func (h *Handler) AdminListSubmissions(c *gin.Context) {
 	limit, _ := strconv.Atoi(limitStr)
 	offset, _ := strconv.Atoi(offsetStr)
 
-	submissions, total, err := svc.AdminList(c.Request.Context(), status, limit, offset)
+	// 按编号（public_id，小写 hex UUID）模糊搜索：统一转小写后转义为 LIKE 模式串。
+	search := buildLikePattern(strings.ToLower(strings.TrimSpace(c.Query("q"))))
+
+	submissions, total, err := svc.AdminList(c.Request.Context(), status, search, limit, offset)
 	if err != nil {
 		apiError(c, http.StatusInternalServerError, ErrCodeInternalError, "查询申请列表失败")
 		return
@@ -224,6 +252,10 @@ func (h *Handler) AdminPublishSubmission(c *gin.Context) {
 	}
 
 	if err := svc.AdminPublish(c.Request.Context(), publicID, board); err != nil {
+		if isDisplayNameConflictError(err) {
+			apiError(c, http.StatusConflict, ErrCodeInvalidParam, err.Error())
+			return
+		}
 		var conflict *onboarding.PSCConflictError
 		if errors.As(err, &conflict) {
 			logger.Warn("admin", "上架 PSC 冲突", "public_id", publicID,
@@ -236,6 +268,20 @@ func (h *Handler) AdminPublishSubmission(c *gin.Context) {
 				},
 				"suggested_channel": conflict.SuggestedChannel,
 			})
+			return
+		}
+		var invalidOverride *onboarding.InvalidPSCOverrideError
+		if errors.As(err, &invalidOverride) {
+			logger.Warn("admin", "上架失败：PSC 覆盖值非法", "public_id", publicID,
+				"field", invalidOverride.Field, "value", invalidOverride.Value)
+			apiError(c, http.StatusBadRequest, ErrCodeInvalidParam, invalidOverride.Error())
+			return
+		}
+		var invalidSlug *onboarding.InvalidProviderSlugError
+		if errors.As(err, &invalidSlug) {
+			logger.Warn("admin", "上架失败：provider slug 需覆盖", "public_id", publicID,
+				"provider_name", invalidSlug.ProviderName, "derived_slug", invalidSlug.DerivedSlug)
+			apiError(c, http.StatusBadRequest, ErrCodeInvalidParam, invalidSlug.Error())
 			return
 		}
 		logger.Error("admin", "上架失败", "public_id", publicID, "error", err)
@@ -292,11 +338,20 @@ func (h *Handler) AdminTestSubmission(c *gin.Context) {
 		return
 	}
 
+	// 与两条公开流程同一道闸：解析完仍拿不到模型就停下，绝不带着 `"model": ""` 去打上游。
+	// 本入口不走 runResolvedProbe（它要自己传 WithCurlCapture），闸得单独接一次——漏接的话
+	// 审核员会看到一个没头没脑的上游 400，而真正的原因是这条申请压根没填模型。
+	if resolvedProbeModel(cfg) == "" {
+		apiError(c, http.StatusUnprocessableEntity, ErrCodeInvalidParam,
+			"测试配置缺少模型：所选模板未声明模型，需在申请里填写模型 ID")
+		return
+	}
+
 	// 使用内联探测器同步执行
 	ctx, cancel := context.WithTimeout(c.Request.Context(), 30*time.Second)
 	defer cancel()
 
-	result := h.inlineProber.ProbeConfig(ctx, cfg)
+	result := h.inlineProber.ProbeConfig(ctx, cfg, probe.WithCurlCapture())
 
 	c.JSON(http.StatusOK, gin.H{
 		"probe_status":     result.ProbeStatus,
@@ -306,5 +361,6 @@ func (h *Handler) AdminTestSubmission(c *gin.Context) {
 		"error_message":    result.ErrorMessage,
 		"response_snippet": result.ResponseSnippet,
 		"probe_id":         result.ProbeID,
+		"curl":             result.Curl,
 	})
 }

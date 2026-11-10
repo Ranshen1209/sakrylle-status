@@ -31,14 +31,15 @@ type ProbeResult struct {
 	Provider        string
 	Service         string
 	Channel         string
-	Model           string            // 模型标识
+	Model           string            // 模型展示名
+	ModelID         string            // 稳定模型 id（md_<uuidv4>），为空表示配置未填
 	Status          int               // 1=绿, 0=红, 2=黄
 	SubStatus       storage.SubStatus // 细分状态（黄色/红色原因）
 	HttpCode        int               // HTTP 状态码（0 表示非 HTTP 错误）
 	Latency         int               // ms
 	Timestamp       int64
 	Error           error
-	ResponseSnippet string // 失败响应摘要（status=0 时组装，截断前 512 字节）
+	ResponseSnippet string // 失败响应摘要（status=0 时组装，见 buildFailureSnippet）
 }
 
 // Prober 探测器
@@ -46,17 +47,97 @@ type Prober struct {
 	clientPool *ClientPool
 	storage    storage.RecordStorage
 	userIDMgr  *identity.UserIDManager
+	// maxBodyBytes 响应体读取上限（含解压后体积），默认 MaxResponseBodyBytes。
+	// 启动期/测试期设置，不做并发保护。
+	maxBodyBytes int64
 }
 
 const httpFailureBodyCaptureLimit = 512
 
+// MaxResponseBodyBytes 是调度器探测路径读取上游响应体的上限（含解压后体积）；
+// 内联探测的 probe.DefaultMaxResponseBytes 引用本值，两条路径同源。
+//
+// 探针只需要正文里的一个关键字，10MB 已是极宽松的上界。超过即截断、不再读：
+// 否则任何一家被监测的第三方都能用超大响应或几 KB 的解压炸弹决定本进程分配多少内存。
+// 截断后照常做内容匹配（答案落在已读前段就仍判绿），判红时 error_detail 首行标注已截断。
+// 刻意不为此新增 response_too_large 细分状态：那个枚举散在存储计数结构、两套 SQL 聚合、
+// timeline 与前端类型/Tooltip/热力图共八处，为一个近乎不会发生的红态再铺一遍不值。
+const MaxResponseBodyBytes int64 = 10 << 20
+
 // NewProber 创建探测器
 func NewProber(storage storage.RecordStorage, userIDMgr *identity.UserIDManager) *Prober {
 	return &Prober{
-		clientPool: NewClientPool(),
-		storage:    storage,
-		userIDMgr:  userIDMgr,
+		clientPool:   NewClientPool(),
+		storage:      storage,
+		userIDMgr:    userIDMgr,
+		maxBodyBytes: MaxResponseBodyBytes,
 	}
+}
+
+// SetMaxResponseBodyBytes 覆盖响应体读取上限；n<=0 恢复默认。启动期/测试期调用。
+func (p *Prober) SetMaxResponseBodyBytes(n int64) {
+	if n <= 0 {
+		n = MaxResponseBodyBytes
+	}
+	p.maxBodyBytes = n
+}
+
+// readBodyLimited 最多读取 limit 字节；超过即停止读取并报告 truncated。
+// 剩余字节刻意不读（不 drain）：这条闸的目的就是不让上游决定我们花多少内存和时间，
+// 连接由调用方 Close 丢弃即可。
+func readBodyLimited(r io.Reader, limit int64) (data []byte, truncated bool, err error) {
+	if limit <= 0 {
+		limit = MaxResponseBodyBytes
+	}
+	data, err = io.ReadAll(io.LimitReader(r, limit+1))
+	if int64(len(data)) > limit {
+		return data[:limit], true, err
+	}
+	return data, false, err
+}
+
+// newUUIDv7 生成 UUIDv7（前 48 位为当前毫秒时间戳）。
+//
+// ⚠️ 熵源失败时**返回空串并记 ERROR，绝不退回 v4**。曾经写成退回 v4，那是错的：
+// v7 的全部意义就是「版本位 + 内嵌真实时间戳」，拿 v4 顶替会让请求照常发出、
+// 上游照常 200、探针照常绿，熵源故障彻底不可见——正是本仓「不要静默兜底、
+// 问题要显式停下」那条准则针对的形态。何况同场景下 uuid.New()（= Must(NewRandom())）
+// 自己就会 panic，那个 fallback 既不保证成功也不保证可观察。
+//
+// 空串会让请求体里出现空标识、被上游拒掉判红，故障因此可见；选它而不是 panic，
+// 是因为一个通道的熵源问题不该拖垮整个监测进程。
+// uuidV7Source 是 uuid.NewV7 的可替换引用。生产恒为它本身；存在的唯一理由是
+// 让上面那条 fail-loud 分支能被测到——未被测试覆盖的错误处理等于没写。
+var uuidV7Source = uuid.NewV7
+
+func newUUIDv7() string {
+	u, err := uuidV7Source()
+	if err != nil {
+		logger.Error("probe", "生成 UUIDv7 失败，占位符将注入空串",
+			"error", err)
+		return ""
+	}
+	return u.String()
+}
+
+// sessionUUID 取本次注入要用的会话级标识。
+//
+// **有稳定行身份（ModelID）才做窗口化派生**，否则退回一次性随机 v7。这个分叉不是保守
+// 兜底，它对应两种真实形态：
+//   - 调度器探测的是一条长期存在的监测行（`model_id` 由 loader/admin 保证非空），它每
+//     5 分钟发一轮，窗口化后就是「一条持续一小时的会话」。用 ModelID 而不是 Model 展示名，
+//     是因为改展示名是运维动作，不该让上游看到「这条会话突然换了身份」。
+//   - inline 探测（自助收录 `/api/onboarding/test`、变更 `/api/change/test`）是**一次性**的
+//     手动动作，一次性会话本来就是它的真实形态。⚠️ 这里更是个正确性问题：onboarding 测试
+//     的 PSC 是占位值（provider 空串 + `channel=__test__`，见 buildOnboardingTestConfig），
+//     模型又由模板钉死，若一并走派生，**不同提交方在同一小时内的测试会共用一个 session-id
+//     与 prompt_cache_key**——各自的 key/base_url 完全不同，却对上游自称同一条会话。
+func sessionUUID(cfg *config.ServiceConfig, requestModel string) string {
+	if cfg.ModelID == "" {
+		return newUUIDv7()
+	}
+	return identity.DeriveSessionUUIDv7(
+		cfg.Provider, cfg.Service, cfg.Channel, cfg.ModelID, requestModel, time.Now())
 }
 
 // InjectVariables 替换所有占位符，返回临时副本（不修改共享 ServiceConfig）
@@ -108,6 +189,24 @@ func InjectVariables(cfg *config.ServiceConfig, uidMgr *identity.UserIDManager) 
 		"{{USER_ID_HASH}}", userIDHash,
 		"{{RAND_UUID}}", uuid.New().String(),
 		"{{RAND_UUID2}}", uuid.New().String(),
+		// v7 变体：前 48 位是当前毫秒时间戳。真实客户端的 session/turn 类标识
+		// 普遍是 v7（codex CLI 实测），拿 v4 冒充会在 version 位和「内嵌时间戳
+		// 对不上请求时刻」两处露馅。需要同值的多个字段共用一个占位符即可。
+		"{{RAND_UUID_V7}}", newUUIDv7(),
+		"{{RAND_UUID_V7_2}}", newUUIDv7(),
+		// 会话级标识：按监测行 + 滚动时间窗派生，窗口内恒定（分叉见 sessionUUID）。
+		// 语义分工与「为什么不能永久冻结」写在 identity.DeriveSessionUUIDv7 与
+		// SessionWindow 的注释里。
+		// ⚠️ 别拿它替 {{RAND_UUID_V7}} 去填 x-client-request-id 这类请求级字段。
+		"{{SESSION_UUID_V7}}", sessionUUID(cfg, requestModel),
+		// 按通道派生、格式合法的稳定 UUID。与 {{USER_ACCOUNT_UUID}} 的区别是
+		// 格式位合规（见 identity.DeriveUUIDv4）；两个槽位是因为真实客户端常同时
+		// 带多个互不相同的稳定标识（如 installation id 与 account id）。
+		"{{STABLE_UUID}}", identity.DeriveUUIDv4(userIDHash, "stable_1"),
+		"{{STABLE_UUID2}}", identity.DeriveUUIDv4(userIDHash, "stable_2"),
+		// 当前 Unix 毫秒。模板里冻结的时间戳会永久漂移，且与 v7 UUID 内嵌的
+		// 时间戳对不上；写成不带引号的占位符即可落成 JSON 数字。
+		"{{UNIX_MS}}", strconv.FormatInt(time.Now().UnixMilli(), 10),
 		"{{USER_ACCOUNT_UUID}}", identity.DeriveUUID(userIDHash, "account_uuid"),
 		"{{PROMPT}}", prompt,
 		"{{EXPECTED_ANSWER}}", expectedAnswer,
@@ -133,6 +232,7 @@ func (p *Prober) Probe(ctx context.Context, cfg *config.ServiceConfig) *ProbeRes
 		Service:   cfg.Service,
 		Channel:   cfg.Channel,
 		Model:     cfg.Model,
+		ModelID:   cfg.ModelID,
 		Timestamp: time.Now().Unix(),
 		SubStatus: storage.SubStatusNone,
 		HttpCode:  0, // 默认为 0，表示非 HTTP 错误
@@ -184,8 +284,13 @@ func (p *Prober) Probe(ctx context.Context, cfg *config.ServiceConfig) *ProbeRes
 	var actualAttempts int
 	// 保存最后一次的响应体（用于最终诊断日志）
 	var lastBodyBytes []byte
+	// 最后一次响应体是否被读取上限截断（0 = 未截断，否则为生效的上限字节数）
+	var lastBodyTruncatedAt int64
 	// 保存最后一次的算术题信息（用于日志）
 	var lastPrompt, lastExpectedAnswer string
+	// 保存最后一次注入后的内容校验关键字：arith 模板每次探测都换一道随机题，
+	// 不留存就无法事后判断「这次判红判得对不对」。摘要组装在重试循环之外，故需带出来。
+	var lastSuccessContains string
 
 	// 重试循环（使用标签以便从 select 中正确跳出）
 retryLoop:
@@ -213,6 +318,7 @@ retryLoop:
 		probeURL, probeBody, probeHeaders, probeSuccessContains, probePrompt, probeExpectedAnswer := InjectVariables(cfg, p.userIDMgr)
 		// 保留最后一次的算术题信息用于日志
 		lastPrompt, lastExpectedAnswer = probePrompt, probeExpectedAnswer
+		lastSuccessContains = probeSuccessContains
 
 		// 准备请求体（去除首尾空白，某些 API 对此敏感）
 		reqBody := bytes.NewBuffer([]byte(strings.TrimSpace(probeBody)))
@@ -293,14 +399,22 @@ retryLoop:
 		// 记录 HTTP 状态码
 		result.HttpCode = resp.StatusCode
 
-		// 完整读取响应体（避免连接泄漏），在需要内容匹配时保留文本
+		// 读取响应体，在需要内容匹配时保留文本。读取有上限（见 MaxResponseBodyBytes）：
+		// 超限即截断并停止读取，不 drain——直接丢弃连接比替上游把剩余字节读完更便宜。
 		var bodyBytes []byte
 		bodyReadLatency := 0
+		var bodyTruncatedAt int64
 		switch {
 		case probeSuccessContains != "":
 			bodyReadStart := time.Now()
-			data, readErr := io.ReadAll(resp.Body)
+			data, truncated, readErr := readBodyLimited(resp.Body, p.maxBodyBytes)
 			bodyReadLatency = int(time.Since(bodyReadStart).Milliseconds())
+			if truncated {
+				bodyTruncatedAt = p.maxBodyBytes
+				logger.Warn("probe", "响应体超过读取上限，已截断",
+					"provider", cfg.Provider, "service", cfg.Service, "channel", cfg.Channel, "model", cfg.Model,
+					"http_code", resp.StatusCode, "limit_bytes", p.maxBodyBytes)
+			}
 			switch {
 			case readErr == nil:
 				totalLatency += bodyReadLatency
@@ -325,7 +439,7 @@ retryLoop:
 					result.Error = readErr
 					lastBodyBytes = data
 					if attempt+1 < maxAttempts {
-						p.logFailedProbe(cfg, result, data)
+						p.logFailedProbe(cfg, result, data, lastSuccessContains)
 						delay := computeRetryDelay(attempt, baseDelay, maxDelay, jitter)
 						logger.Info("probe", "探测失败，准备重试",
 							"provider", cfg.Provider, "service", cfg.Service, "channel", cfg.Channel, "model", cfg.Model,
@@ -344,13 +458,21 @@ retryLoop:
 
 			// 内容解压：根据 Content-Encoding 处理 br/zstd/gzip/deflate
 			// Go 的 http.Transport 在用户显式设置 Accept-Encoding 请求头时不会自动解压
-			bodyBytes = decompressBodyIfNeeded(resp, bodyBytes, cfg.Provider, cfg.Service, cfg.Channel, cfg.Model)
+			// 解压输出同样受上限约束，否则几 KB 的解压炸弹就能绕过上面的读取上限。
+			var decompressTruncated bool
+			bodyBytes, decompressTruncated = decompressBodyLimited(resp, bodyBytes, p.maxBodyBytes, cfg.Provider, cfg.Service, cfg.Channel, cfg.Model)
+			if decompressTruncated {
+				bodyTruncatedAt = p.maxBodyBytes
+				logger.Warn("probe", "解压后响应体超过读取上限，已截断",
+					"provider", cfg.Provider, "service", cfg.Service, "channel", cfg.Channel, "model", cfg.Model,
+					"http_code", resp.StatusCode, "limit_bytes", p.maxBodyBytes)
+			}
 		case shouldCaptureHTTPFailureBody(resp.StatusCode):
 			bodyReadStart := time.Now()
 			data, readErr := readBodyPrefixAndDrain(resp.Body, httpFailureBodyCaptureLimit)
 			bodyReadLatency = int(time.Since(bodyReadStart).Milliseconds())
 			totalLatency += bodyReadLatency
-			bodyBytes = decompressBodyIfNeeded(resp, data, cfg.Provider, cfg.Service, cfg.Channel, cfg.Model)
+			bodyBytes, _ = decompressBodyLimited(resp, data, p.maxBodyBytes, cfg.Provider, cfg.Service, cfg.Channel, cfg.Model)
 			switch {
 			case readErr == nil:
 			case isTolerableReadError(readErr):
@@ -370,6 +492,7 @@ retryLoop:
 
 		// 保存响应体用于最终诊断
 		lastBodyBytes = bodyBytes
+		lastBodyTruncatedAt = bodyTruncatedAt
 
 		// 判定状态（先按 HTTP/延迟，再根据响应内容做二次判断）
 		attemptLatency := headerLatency + bodyReadLatency
@@ -384,7 +507,7 @@ retryLoop:
 		// 重试条件：status=0（红色）且非超时
 		if result.Status == 0 && attempt+1 < maxAttempts {
 			// 输出诊断信息（重试前输出）
-			p.logFailedProbe(cfg, result, bodyBytes)
+			p.logFailedProbe(cfg, result, bodyBytes, lastSuccessContains)
 
 			delay := computeRetryDelay(attempt, baseDelay, maxDelay, jitter)
 			logger.Info("probe", "探测失败，准备重试",
@@ -410,7 +533,7 @@ retryLoop:
 	// 最终诊断日志（仅在最终结果为红色时输出）
 	if result.Status == 0 {
 		// 输出诊断信息（使用保存的最后一次响应体）
-		p.logFailedProbe(cfg, result, lastBodyBytes)
+		p.logFailedProbe(cfg, result, lastBodyBytes, lastSuccessContains)
 
 		logger.Warn("probe", "探测最终失败",
 			"provider", cfg.Provider, "service", cfg.Service, "channel", cfg.Channel, "model", cfg.Model,
@@ -428,10 +551,7 @@ retryLoop:
 		logArgs = append(logArgs, "prompt", lastPrompt, "expected", lastExpectedAnswer)
 	}
 	if len(lastBodyBytes) > 0 {
-		snippet := strings.TrimSpace(AggregateResponseText(lastBodyBytes))
-		if snippet == "" {
-			snippet = strings.TrimSpace(string(lastBodyBytes))
-		}
+		snippet := ResponseSnippetText(lastBodyBytes)
 		if len(snippet) > 200 {
 			snippet = snippet[:200] + "..."
 		}
@@ -443,54 +563,55 @@ retryLoop:
 
 	// 组装失败响应摘要：仅 status=0 时写入，用于持久化排障
 	if result.Status == 0 {
-		const maxErrorDetailLen = 512
-		var snippet string
-		if len(lastBodyBytes) > 0 {
-			snippet = strings.TrimSpace(AggregateResponseText(lastBodyBytes))
-			if snippet == "" {
-				snippet = strings.TrimSpace(string(lastBodyBytes))
-			}
-		} else if result.Error != nil {
-			snippet = result.Error.Error()
-		}
-		if len(snippet) > maxErrorDetailLen {
-			snippet = snippet[:maxErrorDetailLen]
-		}
-		result.ResponseSnippet = snippet
+		result.ResponseSnippet = buildFailureSnippet(result, lastBodyBytes, lastSuccessContains, lastBodyTruncatedAt)
 	}
 
 	return result
 }
 
+// maxErrorDetailLen 是非 content_mismatch 红态摘要的长度上限。
+// content_mismatch 走结构化摘要、自带更细的分段预算，不受这个值约束。
+const maxErrorDetailLen = 512
+
+// buildFailureSnippet 组装写库的失败摘要。
+//
+// content_mismatch 单独走结构化摘要：它是唯一「HTTP 层完全正常、判红理由只存在于
+// 响应内容里」的红态，原样截一段响应体说明不了任何事——SSE 流的开头恒为握手元数据。
+// 其余红态的响应体本身就是上游的错误信息，头部即有效信息，保持原样。
+//
+// truncatedAt 非 0 表示响应体被读取上限截断（值为生效的上限字节数），此时在摘要**首行**
+// 标注——放首行是为了不被后面的头部截断吃掉；判据本身照常按已读前段给出。
+func buildFailureSnippet(result *ProbeResult, body []byte, successContains string, truncatedAt int64) string {
+	var snippet string
+	if result.SubStatus == storage.SubStatusContentMismatch {
+		snippet = BuildContentMismatchSummary(body, successContains)
+	} else {
+		if len(body) > 0 {
+			snippet = ResponseSnippetText(body)
+		} else if result.Error != nil {
+			snippet = result.Error.Error()
+		}
+		snippet = sanitizeForStorage(truncateHead(snippet, maxErrorDetailLen))
+	}
+	if truncatedAt > 0 {
+		snippet = fmt.Sprintf("response_truncated: 响应体超过 %d 字节读取上限，仅按已读前段判定\n%s", truncatedAt, snippet)
+	}
+	return snippet
+}
+
 // logFailedProbe 输出探测失败的诊断信息
-func (p *Prober) logFailedProbe(cfg *config.ServiceConfig, result *ProbeResult, bodyBytes []byte) {
+func (p *Prober) logFailedProbe(cfg *config.ServiceConfig, result *ProbeResult, bodyBytes []byte, successContains string) {
 	const maxSnippetLen = 512 // 防止日志过长
 
-	// content_mismatch 特殊处理：即便响应体为空/仅空白，也输出诊断信息
+	// content_mismatch 与写库摘要同源：日志和管理后台对同一次失败必须给出同一套说法，
+	// 否则排障时两边对不上。响应体为空/无法提取文本的情况也由摘要自行表达。
 	if result.SubStatus == storage.SubStatusContentMismatch {
-		aggText := AggregateResponseText(bodyBytes)
-		trimmed := strings.TrimSpace(aggText)
-
-		if trimmed == "" {
-			// body_bytes > 0 但 agg_len = 0 说明聚合器未能提取文本（如二进制/不识别格式）
-			logger.Warn("probe", "内容校验失败：响应体为空或无法提取文本",
-				"provider", cfg.Provider, "service", cfg.Service, "channel", cfg.Channel, "model", cfg.Model,
-				"body_bytes", len(bodyBytes), "agg_len", len(aggText), "keyword_len", len(cfg.SuccessContains))
-		} else {
-			snippet := trimmed
-			if len(snippet) > maxSnippetLen {
-				snippet = snippet[:maxSnippetLen] + "... (truncated)"
-			}
-			logger.Warn("probe", "内容校验失败：未包含预期关键字",
-				"provider", cfg.Provider, "service", cfg.Service, "channel", cfg.Channel, "model", cfg.Model,
-				"body_bytes", len(bodyBytes), "keyword_len", len(cfg.SuccessContains), "snippet", snippet)
-		}
+		logger.Warn("probe", "内容校验失败",
+			"provider", cfg.Provider, "service", cfg.Service, "channel", cfg.Channel, "model", cfg.Model,
+			"body_bytes", len(bodyBytes), "summary", BuildContentMismatchSummary(bodyBytes, successContains))
 	} else if len(bodyBytes) > 0 {
 		// 其他红色状态：保持原有行为，在有响应体时输出片段
-		snippet := strings.TrimSpace(AggregateResponseText(bodyBytes))
-		if snippet == "" {
-			snippet = strings.TrimSpace(string(bodyBytes))
-		}
+		snippet := ResponseSnippetText(bodyBytes)
 		if snippet != "" {
 			if len(snippet) > maxSnippetLen {
 				snippet = snippet[:maxSnippetLen] + "... (truncated)"
@@ -537,119 +658,128 @@ func evaluateStatus(baseStatus int, baseSubStatus storage.SubStatus, body []byte
 
 // decompressBodyIfNeeded 根据 Content-Encoding 解压响应体，失败则保留原始数据。
 // 支持 br/zstd/gzip/deflate，并保留 gzip/zstd 魔术头兜底处理。
+// decompressBodyIfNeeded 是 decompressBodyLimited 的默认上限版本，供只关心内容、
+// 不关心是否被截断的调用方使用。
 func decompressBodyIfNeeded(resp *http.Response, data []byte, provider, service, channel, model string) []byte {
+	out, _ := decompressBodyLimited(resp, data, MaxResponseBodyBytes, provider, service, channel, model)
+	return out
+}
+
+// decompressBodyLimited 按 Content-Encoding（或魔术头）解压，解压输出最多 limit 字节；
+// 第二个返回值表示输出被截断。解压失败沿用原行为：回退原始字节、不算截断。
+func decompressBodyLimited(resp *http.Response, data []byte, limit int64, provider, service, channel, model string) ([]byte, bool) {
 	if len(data) == 0 {
-		return data
+		return data, false
 	}
 
 	contentEncoding := strings.ToLower(resp.Header.Get("Content-Encoding"))
 
 	switch {
 	case strings.Contains(contentEncoding, "br"):
-		return decompressBrotli(data, provider, service, channel, model, true)
+		return decompressBrotli(data, limit, provider, service, channel, model, true)
 	case strings.Contains(contentEncoding, "zstd"):
-		return decompressZstd(data, provider, service, channel, model)
+		return decompressZstd(data, limit, provider, service, channel, model)
 	case strings.Contains(contentEncoding, "gzip"):
-		return decompressGzip(data, provider, service, channel, model)
+		return decompressGzip(data, limit, provider, service, channel, model)
 	case strings.Contains(contentEncoding, "deflate"):
-		return decompressDeflate(data, provider, service, channel, model)
+		return decompressDeflate(data, limit, provider, service, channel, model)
 	default:
 		// 兜底：服务端未声明 Content-Encoding 时，检查魔术头
 		if isGzipMagic(data) {
-			return decompressGzip(data, provider, service, channel, model)
+			return decompressGzip(data, limit, provider, service, channel, model)
 		}
 		if isZstdMagic(data) {
-			return decompressZstd(data, provider, service, channel, model)
+			return decompressZstd(data, limit, provider, service, channel, model)
 		}
 		if looksBinary(data) {
-			return decompressBrotli(data, provider, service, channel, model, false)
+			return decompressBrotli(data, limit, provider, service, channel, model, false)
 		}
 	}
 
-	return data
+	return data, false
 }
 
-func decompressBrotli(data []byte, provider, service, channel, model string, logError bool) []byte {
+func decompressBrotli(data []byte, limit int64, provider, service, channel, model string, logError bool) ([]byte, bool) {
 	reader := brotli.NewReader(bytes.NewReader(data))
-	decompressed, err := io.ReadAll(reader)
+	decompressed, truncated, err := readBodyLimited(reader, limit)
 	if err != nil {
 		if logError {
 			logger.Warn("probe", "br 解压失败，使用原始响应体",
 				"provider", provider, "service", service, "channel", channel, "model", model, "error", err)
 		}
-		return data
+		return data, false
 	}
 
 	logger.Debug("probe", "br 解压成功",
 		"provider", provider, "service", service, "channel", channel, "model", model,
-		"compressed_size", len(data), "decompressed_size", len(decompressed))
-	return decompressed
+		"compressed_size", len(data), "decompressed_size", len(decompressed), "truncated", truncated)
+	return decompressed, truncated
 }
 
-func decompressZstd(data []byte, provider, service, channel, model string) []byte {
+func decompressZstd(data []byte, limit int64, provider, service, channel, model string) ([]byte, bool) {
 	decoder, err := zstd.NewReader(bytes.NewReader(data))
 	if err != nil {
 		logger.Warn("probe", "zstd 解压初始化失败，使用原始响应体",
 			"provider", provider, "service", service, "channel", channel, "model", model, "error", err)
-		return data
+		return data, false
 	}
 	defer decoder.Close()
 
-	decompressed, err := io.ReadAll(decoder)
+	decompressed, truncated, err := readBodyLimited(decoder, limit)
 	if err != nil {
 		logger.Warn("probe", "zstd 解压读取失败，使用原始响应体",
 			"provider", provider, "service", service, "channel", channel, "model", model, "error", err)
-		return data
+		return data, false
 	}
 
 	logger.Debug("probe", "zstd 解压成功",
 		"provider", provider, "service", service, "channel", channel, "model", model,
-		"compressed_size", len(data), "decompressed_size", len(decompressed))
-	return decompressed
+		"compressed_size", len(data), "decompressed_size", len(decompressed), "truncated", truncated)
+	return decompressed, truncated
 }
 
-func decompressGzip(data []byte, provider, service, channel, model string) []byte {
+func decompressGzip(data []byte, limit int64, provider, service, channel, model string) ([]byte, bool) {
 	gr, err := gzip.NewReader(bytes.NewReader(data))
 	if err != nil {
 		logger.Warn("probe", "gzip 解压初始化失败，使用原始响应体",
 			"provider", provider, "service", service, "channel", channel, "model", model, "error", err)
-		return data
+		return data, false
 	}
 	defer gr.Close()
 
-	decompressed, err := io.ReadAll(gr)
+	decompressed, truncated, err := readBodyLimited(gr, limit)
 	if err != nil {
 		logger.Warn("probe", "gzip 解压读取失败，使用原始响应体",
 			"provider", provider, "service", service, "channel", channel, "model", model, "error", err)
-		return data
+		return data, false
 	}
 
 	logger.Debug("probe", "gzip 解压成功",
 		"provider", provider, "service", service, "channel", channel, "model", model,
-		"compressed_size", len(data), "decompressed_size", len(decompressed))
-	return decompressed
+		"compressed_size", len(data), "decompressed_size", len(decompressed), "truncated", truncated)
+	return decompressed, truncated
 }
 
-func decompressDeflate(data []byte, provider, service, channel, model string) []byte {
+func decompressDeflate(data []byte, limit int64, provider, service, channel, model string) ([]byte, bool) {
 	reader, err := zlib.NewReader(bytes.NewReader(data))
 	if err != nil {
 		logger.Warn("probe", "deflate 解压初始化失败，使用原始响应体",
 			"provider", provider, "service", service, "channel", channel, "model", model, "error", err)
-		return data
+		return data, false
 	}
 	defer reader.Close()
 
-	decompressed, err := io.ReadAll(reader)
+	decompressed, truncated, err := readBodyLimited(reader, limit)
 	if err != nil {
 		logger.Warn("probe", "deflate 解压读取失败，使用原始响应体",
 			"provider", provider, "service", service, "channel", channel, "model", model, "error", err)
-		return data
+		return data, false
 	}
 
 	logger.Debug("probe", "deflate 解压成功",
 		"provider", provider, "service", service, "channel", channel, "model", model,
-		"compressed_size", len(data), "decompressed_size", len(decompressed))
-	return decompressed
+		"compressed_size", len(data), "decompressed_size", len(decompressed), "truncated", truncated)
+	return decompressed, truncated
 }
 
 func isGzipMagic(data []byte) bool {
@@ -694,9 +824,12 @@ func (p *Prober) determineStatus(statusCode, latency int, slowLatency time.Durat
 		return 1, storage.SubStatusNone
 	}
 
-	// 3xx = 绿色（重定向，通常由客户端自动处理，视为正常）
+	// 3xx = 红色（不合规）。HTTP client 默认已自动跟随重定向（最多 10 跳），
+	// 合规的 http→https / 尾斜杠跳转早被透明跟完，到这里只剩跟不动的畸形重定向
+	// （无 Location 头、非法 scheme、超跳数等）——对 LLM API 而言这不是可用响应，
+	// 与 inline 自助探测的 redirect_blocked 口径一致，归入 client_error 桶。
 	if statusCode >= 300 && statusCode < 400 {
-		return 1, storage.SubStatusNone
+		return 0, storage.SubStatusClientError
 	}
 
 	// 401/403 = 红色（认证/权限失败）
@@ -733,52 +866,167 @@ func (p *Prober) determineStatus(statusCode, latency int, slowLatency time.Durat
 	return 0, storage.SubStatusClientError
 }
 
-// aggregateResponseText 将原始响应体整理为用于关键字匹配的文本。
-// - 普通 JSON/文本：直接使用完整 body
-// - SSE / 流式响应：尝试解析 data: 行中的增量内容并拼接
-func AggregateResponseText(body []byte) string {
+// responseTextSource 说明内容校验最终拿什么在做匹配。
+type responseTextSource string
+
+const (
+	// textSourceEmpty：响应体为空。
+	textSourceEmpty responseTextSource = "empty"
+	// textSourceSSE：从 SSE 流里抽到了模型正文。
+	textSourceSSE responseTextSource = "sse_text"
+	// textSourceBody：非流式响应，响应体本身就是匹配对象。
+	textSourceBody responseTextSource = "body"
+	// textSourceNone：确实是 SSE 流，但一个字正文都没抽到。
+	//
+	// 它必须与 textSourceBody 分开：2026-09-11 之前两者被合并成「回退到整包 body」，
+	// 于是 success_contains 变成拿协议信封（事件名、request-id、usage、**思考摘要**）
+	// 做 grep——模型正文一个字没输出，也可能被信封里恰好出现的关键字判绿。
+	textSourceNone responseTextSource = "none"
+)
+
+// aggregateResponseText 给出内容校验应当匹配的文本及其来源。
+func aggregateResponseText(body []byte) (string, responseTextSource) {
 	if len(body) == 0 {
-		return ""
+		return "", textSourceEmpty
 	}
 
-	// 启发式检测 SSE 格式：
-	// - 标准 SSE：同时包含 "event:" 和 "data:"
-	// - Gemini SSE：只有 "data:" 行（以 "data:" 开头或包含 "\ndata:"）
-	isSSE := bytes.Contains(body, []byte("event:")) && bytes.Contains(body, []byte("data:"))
-	if !isSSE {
-		isSSE = bytes.HasPrefix(body, []byte("data:")) || bytes.Contains(body, []byte("\ndata:"))
-	}
-	if isSSE {
-		if sseText := ExtractTextFromSSE(body); sseText != "" {
-			return sseText
-		}
+	if !looksLikeSSE(body) {
+		// 非流式响应：响应体本身就是模型输出（或上游错误体），整体即匹配对象。
+		return string(body), textSourceBody
 	}
 
-	// 回退到原始响应体
-	return string(body)
+	text := ExtractTextFromSSE(body)
+	if strings.TrimSpace(text) == "" {
+		// ⚠️ 这里刻意**不回退整包 body**，理由见 textSourceNone。
+		return "", textSourceNone
+	}
+	return text, textSourceSSE
 }
 
-// extractTextFromSSE 从 text/event-stream 风格的响应体中抽取语义文本。
-// 当前支持的模式：
-// - Anthropic: event: content_block_delta + data: {"delta":{"type":"text_delta","text":"..."}}
-// - OpenAI Chat: data: {"choices":[{"delta":{"content":"..."}}]}
-// - OpenAI Responses API:
-//   - event: response.output_text.delta + data: {"delta":"..."}（增量）
-//   - event: response.output_text.done + data: {"text":"..."}（完整，兜底）
-//   - Gemini API: data: {"candidates":[{"content":{"parts":[{"text":"..."}]}}]}
-//     注意：Gemini SSE 没有 event: 行，只有 data: 行；流式响应中 text 可能被拆分
+// AggregateResponseText 是内容校验（success_contains）的匹配对象。
 //
-// 解析失败时会尽量回退到原始 data 文本。
+// ⚠️ SSE 流抽不到正文时返回空串，**不回退到整包响应体**。要「给人看」的片段
+// 请用 ResponseSnippetText——同一份响应体，两个问题的正确答案在这一点上相反。
+func AggregateResponseText(body []byte) string {
+	text, _ := aggregateResponseText(body)
+	return text
+}
+
+// ResponseSnippetText 给出**展示用**片段：抽得到正文就给正文，抽不到就退回响应体原文。
+//
+// 与匹配用的 AggregateResponseText 分开是必须的：日志与管理后台要的是「看懂发生了
+// 什么」，此时上游的错误信封恰恰是关键信息；内容校验要的是「模型到底输出了什么」，
+// 信封必须排除。此前两者共用一个函数，三个调用点各自手写
+// `if snippet == "" { snippet = string(body) }` 找补，第四个（internal/probe/inline.go）
+// 漏写——管理后台点一次探测就看不到上游错误。语义收进函数即不再有第五次漏写。
+func ResponseSnippetText(body []byte) string {
+	if text, source := aggregateResponseText(body); source == textSourceSSE || source == textSourceBody {
+		if trimmed := strings.TrimSpace(text); trimmed != "" {
+			return trimmed
+		}
+	}
+	return strings.TrimSpace(string(body))
+}
+
+// looksLikeSSE 启发式判定响应体是否为 text/event-stream 风格：
+// - 标准 SSE：同时包含 "event:" 和 "data:"
+// - Gemini SSE：只有 "data:" 行（以 "data:" 开头或包含 "\ndata:"）
+func looksLikeSSE(body []byte) bool {
+	if bytes.Contains(body, []byte("event:")) && bytes.Contains(body, []byte("data:")) {
+		return true
+	}
+	return bytes.HasPrefix(body, []byte("data:")) || bytes.Contains(body, []byte("\ndata:"))
+}
+
+// 承载模型正文的事件名。必须显式列出：Responses 协议把正文与**思考摘要**放在同名
+// 同型的字段里（顶层 `delta` / 顶层 `text`），只看字段形状分不出来。
+const (
+	// OpenAI Responses 协议
+	eventOutputTextDelta   = "response.output_text.delta"
+	eventOutputTextDone    = "response.output_text.done"
+	eventContentPartDone   = "response.content_part.done"
+	eventOutputItemDone    = "response.output_item.done"
+	eventResponseCompleted = "response.completed"
+
+	// Anthropic Messages 协议。它的正文只出现在这一个事件里
+	// （message_delta 的 delta 装的是 stop_reason，没有 text）。
+	eventContentBlockDelta = "content_block_delta"
+)
+
+// sseTextCandidates 按来源分桶收集正文候选。
+//
+// 为什么不能像 2026-09-11 之前那样边扫边往同一个 builder 里写：Responses 协议会把
+// 同一份正文分五种形态重复投递（delta 增量 / output_text.done / content_part.done /
+// output_item.done / completed 快照），混在一起就是同一句话被拼好几遍；而「先到先得」
+// （旧代码的 `b.Len() == 0`）又会让先到的半截 delta 挡住后到的完整快照。
+// 分桶 + 只取一个，两个方向的错都不会发生。
+type sseTextCandidates struct {
+	completed strings.Builder // response.completed（整份响应快照，最完整）
+	itemDone  strings.Builder // response.output_item.done
+	partDone  strings.Builder // response.content_part.done
+	textDone  strings.Builder // response.output_text.done
+	textDelta strings.Builder // response.output_text.delta（增量，按到达顺序拼接）
+
+	// nonResponses 装 Responses 之外的协议：Anthropic content_block_delta、
+	// OpenAI Chat chunk、Gemini candidates，以及无事件类型的私有纯文本格式。
+	// 它们**主要**靠字段结构识别，另受一道弱事件门（见写入处），
+	// 以免未知私有事件借嵌套结构绕过 Responses 白名单。
+	nonResponses strings.Builder
+}
+
+// pick 取最高优先级的非空候选。**绝不跨桶拼接**——各桶装的是同一段正文的不同
+// 投递形态，拼起来等于把同一句话说好几遍。
+func (c *sseTextCandidates) pick() string {
+	for _, b := range []*strings.Builder{
+		&c.completed, &c.itemDone, &c.partDone, &c.textDone, &c.textDelta, &c.nonResponses,
+	} {
+		if b.Len() > 0 {
+			return b.String()
+		}
+	}
+	return ""
+}
+
+// ExtractTextFromSSE 从 text/event-stream 风格的响应体中抽取**模型正文**。
+// 支持的形态：
+//   - Anthropic: event: content_block_delta + data: {"delta":{"type":"text_delta","text":"..."}}
+//   - OpenAI Chat: data: {"choices":[{"delta":{"content":"..."}}]}
+//   - OpenAI Responses: output_text.delta / output_text.done / content_part.done /
+//     output_item.done / completed，见上方常量
+//   - Gemini: data: {"candidates":[{"content":{"parts":[{"text":"..."}]}}]}
+//     （Gemini SSE 没有 event: 行，且 text 可能被拆到多个 chunk，需累积拼接）
+//
+// ⚠️ **只有正文算数，思考摘要不算**。Responses 协议的 reasoning_summary_text.delta /
+// .done 与正文事件用同名同型的字段传内容，2026-09-11 之前它们被一视同仁地累加，
+// 于是「模型只在思考里写出答案、正文一个字没输出」也判绿——生产上 8 条火山方舟
+// native 通道实测命中这条路径（reasoning done 恰好排在正文之前，把当时还空的
+// builder 填满）。所以顶层 `delta` / `text` 一律需要事件类型授权。
 func ExtractTextFromSSE(body []byte) string {
 	scanner := bufio.NewScanner(bytes.NewReader(body))
 	// 提升单行上限，避免极端情况下行太长
 	buf := make([]byte, 0, 64*1024)
 	scanner.Buffer(buf, 1024*1024)
 
-	var b strings.Builder
+	var cand sseTextCandidates
+
+	// SSE 的 event: 行在 data: 行之前，故需跨行记忆；空行是帧分隔符，作用域到此为止。
+	//
+	// ⚠️ 与 SSEDigest.LastEvent 的**粘滞**语义刻意不同：那里「最后一个叫得出名字的
+	// 事件」是有用的摘要字段；这里必须是**当前帧**的类型，沿用上一帧会把 reasoning
+	// 的内容记到 output 名下——那正是本函数要防的事。
+	pendingEvent := ""
 
 	for scanner.Scan() {
 		line := strings.TrimSpace(scanner.Text())
+
+		if line == "" {
+			pendingEvent = ""
+			continue
+		}
+		if strings.HasPrefix(line, "event:") {
+			pendingEvent = strings.TrimSpace(strings.TrimPrefix(line, "event:"))
+			continue
+		}
 		if !strings.HasPrefix(line, "data:") {
 			continue
 		}
@@ -788,102 +1036,186 @@ func ExtractTextFromSSE(body []byte) string {
 			continue
 		}
 
+		event := pendingEvent
+
 		var obj map[string]any
 		if err := json.Unmarshal([]byte(payload), &obj); err != nil {
-			// 非 JSON data，直接拼接原始内容
-			if b.Len() > 0 {
-				b.WriteByte(' ')
+			// 私有的**纯文本** SSE 格式（`data: RP_ANSWER=127` 这种）仍当正文，
+			// 但要同时排掉两类冒牌货：
+			//   ① 带事件名的——正文该由该事件所属协议的规则决定（未知事件同样排除）；
+			//   ② 看起来是 JSON 却解不出来的——那是被截断/损坏的结构化 payload。
+			// ② 补的是一处真实的不对称：`{"type":"error","message":"…"}` 完整时会被
+			// 事件类型挡住，一旦在传输中被截断反而解析失败、整段错误体混进正文。
+			// 判据用首字符而非「解析失败」本身，这是一条**策略假设**：以 { 或 [ 开头
+			// 一律按「结构化 payload 坏了」处理，代价是首字符恰为括号的私有纯文本
+			// 正文会被丢掉（实测非 JSON payload 0 条，当前无此形态）。
+			if event == "" && !looksLikeJSON(payload) {
+				if cand.nonResponses.Len() > 0 {
+					cand.nonResponses.WriteByte(' ')
+				}
+				cand.nonResponses.WriteString(payload)
 			}
-			b.WriteString(payload)
 			continue
 		}
 
-		appendText := func(s string) {
-			if s == "" {
-				return
-			}
-			b.WriteString(s)
-		}
-
-		// Anthropic: {"type":"content_block_delta", "delta":{"type":"text_delta","text":"..."}}
-		if delta, ok := obj["delta"].(map[string]any); ok {
-			if text, ok := delta["text"].(string); ok {
-				appendText(text)
+		// payload 自带的 type 优先于 event: 行——它与 payload 同帧，不会被跨帧串味。
+		if eventType, ok := obj["type"].(string); ok {
+			if trimmed := strings.TrimSpace(eventType); trimmed != "" {
+				event = trimmed
 			}
 		}
 
-		// OpenAI Chat: {"choices":[{"delta":{"content":"..."}}]}
-		if choices, ok := obj["choices"].([]any); ok {
-			for _, ch := range choices {
-				chMap, ok := ch.(map[string]any)
-				if !ok {
-					continue
-				}
-				delta, ok := chMap["delta"].(map[string]any)
-				if !ok {
-					continue
-				}
-				if text, ok := delta["content"].(string); ok {
-					appendText(text)
+		// —— 以下三种靠字段结构识别，属于 Responses 之外的协议 ——
+		//
+		// 它们仍受一道**弱**事件门：类型为空（OpenAI Chat chunk 与 Gemini 本来就不带
+		// type，也没有 event: 行）或恰是 Anthropic 的 content_block_delta 才采纳。
+		// 没有这道门，`{"type":"codex.future","delta":{"text":"…"}}` 这类未来才出现的
+		// 私有事件会绕过下面的 Responses 白名单，把非正文写进正文桶——「未知事件不
+		// 贡献正文」那条原则就只对顶层字段成立、对嵌套结构不成立了。
+		// 111 份真实样本里「带 type 且非 content_block_delta、却携嵌套正文结构」为 0 条，
+		// 故这道门当前零兼容代价。
+		if event == "" || event == eventContentBlockDelta {
+			// Anthropic: {"type":"content_block_delta","delta":{"type":"text_delta","text":"..."}}
+			if delta, ok := obj["delta"].(map[string]any); ok {
+				if text, ok := delta["text"].(string); ok {
+					cand.nonResponses.WriteString(text)
 				}
 			}
-		}
 
-		// OpenAI Responses API: {"delta":"pong",...} - 顶层 delta 直接是字符串
-		if delta, ok := obj["delta"].(string); ok {
-			appendText(delta)
-		}
-
-		// OpenAI Responses API: {"text":"pong",...} - response.output_text.done 事件
-		// 完整 text 通常已通过增量累积，这里仅作兜底（当 builder 为空时使用）
-		if text, ok := obj["text"].(string); ok {
-			if b.Len() == 0 {
-				appendText(text)
-			}
-		}
-
-		// Gemini API: {"candidates":[{"content":{"parts":[{"text":"..."}]}}]}
-		// 流式响应中 text 可能被拆分到多个 chunk（如 "po" + "ng"），需要累积拼接
-		if candidates, ok := obj["candidates"].([]any); ok {
-			for _, c := range candidates {
-				cm, ok := c.(map[string]any)
-				if !ok {
-					continue
-				}
-				content, ok := cm["content"].(map[string]any)
-				if !ok {
-					continue
-				}
-				parts, ok := content["parts"].([]any)
-				if !ok {
-					continue
-				}
-				for _, p := range parts {
-					pm, ok := p.(map[string]any)
+			// OpenAI Chat: {"choices":[{"delta":{"content":"..."}}]}
+			if choices, ok := obj["choices"].([]any); ok {
+				for _, ch := range choices {
+					chMap, ok := ch.(map[string]any)
 					if !ok {
 						continue
 					}
-					if text, ok := pm["text"].(string); ok {
-						appendText(text)
+					delta, ok := chMap["delta"].(map[string]any)
+					if !ok {
+						continue
+					}
+					if text, ok := delta["content"].(string); ok {
+						cand.nonResponses.WriteString(text)
+					}
+				}
+			}
+
+			// Gemini: {"candidates":[{"content":{"parts":[{"text":"..."}]}}]}
+			if candidates, ok := obj["candidates"].([]any); ok {
+				for _, c := range candidates {
+					cm, ok := c.(map[string]any)
+					if !ok {
+						continue
+					}
+					content, ok := cm["content"].(map[string]any)
+					if !ok {
+						continue
+					}
+					parts, ok := content["parts"].([]any)
+					if !ok {
+						continue
+					}
+					for _, p := range parts {
+						pm, ok := p.(map[string]any)
+						if !ok {
+							continue
+						}
+						if text, ok := pm["text"].(string); ok {
+							cand.nonResponses.WriteString(text)
+						}
 					}
 				}
 			}
 		}
 
-		// 通用兜底：顶层 content / message 字段
-		if content, ok := obj["content"].(string); ok {
-			appendText(content)
+		// —— 以下是 Responses 协议：字段本身有歧义，一律由事件类型授权 ——
+		// 未知事件类型（含将来新增的 codex.* / responsesapi.* 一类私有事件）在这里
+		// 走 default，在上面那道弱事件门也进不去 nonResponses——**两条路都不贡献
+		// 正文**，这条原则因此对顶层字段与嵌套结构同时成立。
+		// 宁可抽不到判红，也不能把非正文当正文判绿。
+		switch event {
+		case eventOutputTextDelta:
+			if delta, ok := obj["delta"].(string); ok {
+				cand.textDelta.WriteString(delta)
+			}
+		case eventOutputTextDone:
+			if text, ok := obj["text"].(string); ok {
+				cand.textDone.WriteString(text)
+			}
+		case eventContentPartDone:
+			appendContentText(obj["part"], &cand.partDone)
+		case eventOutputItemDone:
+			if item, ok := obj["item"].(map[string]any); ok {
+				appendContentTexts(item["content"], &cand.itemDone)
+			}
+		case eventResponseCompleted:
+			// ⚠️ 明确标着 incomplete/failed 的快照一律不采纳；status 缺失或不是字符串时
+			// **仍然采纳**——宁可信任一份没有自我否定的快照，也不为一个可选字段的缺席
+			// 去误红。这个桶在 pick 里优先级最高，采纳残缺快照就会盖掉本来完整的 delta，
+			// 把一次成功的探测判成红。实测 49 条快照全带 status=completed，故当前零代价。
+			if response, ok := obj["response"].(map[string]any); ok {
+				if status, ok := response["status"].(string); ok && status != "completed" {
+					break
+				}
+				if output, ok := response["output"].([]any); ok {
+					for _, rawItem := range output {
+						item, ok := rawItem.(map[string]any)
+						if !ok {
+							continue
+						}
+						appendContentTexts(item["content"], &cand.completed)
+					}
+				}
+			}
 		}
-		if msg, ok := obj["message"].(string); ok {
-			appendText(msg)
+
+		// 私有格式的顶层正文字段：同样只在本帧没有事件类型时采纳。
+		// 正是这个条件挡住了 `{"type":"error","message":"Our servers are currently
+		// overloaded…"}`——它的 type 非空，走不进来。旧实现没有这道门，于是上游错误
+		// 信封被当成正文，摘要印出 `extracted=61chars` 而模型一个字都没输出。
+		if event == "" {
+			if content, ok := obj["content"].(string); ok {
+				cand.nonResponses.WriteString(content)
+			}
+			if msg, ok := obj["message"].(string); ok {
+				cand.nonResponses.WriteString(msg)
+			}
 		}
 	}
 
 	if err := scanner.Err(); err != nil {
-		// 扫描出错时，尽量返回已有内容；彻底失败则交由上层回退
+		// 扫描出错时，尽量返回已抽到的内容；彻底失败交由上层按「抽不到」处理。
+		_ = err
 	}
 
-	return b.String()
+	return cand.pick()
+}
+
+// looksLikeJSON 判断这段 payload 是否**打算**是 JSON（哪怕解析失败）。
+// 用于把「被截断的结构化 payload」与「私有的纯文本正文」区分开。
+func looksLikeJSON(payload string) bool {
+	return strings.HasPrefix(payload, "{") || strings.HasPrefix(payload, "[")
+}
+
+// appendContentTexts 收 `content: [{"text": "..."}]` 这种列表形态的正文。
+func appendContentTexts(v any, dst *strings.Builder) {
+	contents, ok := v.([]any)
+	if !ok {
+		return
+	}
+	for _, raw := range contents {
+		appendContentText(raw, dst)
+	}
+}
+
+// appendContentText 收单个 content part 的 text 字段。
+func appendContentText(v any, dst *strings.Builder) {
+	part, ok := v.(map[string]any)
+	if !ok {
+		return
+	}
+	if text, ok := part["text"].(string); ok {
+		dst.WriteString(text)
+	}
 }
 
 // SaveResult 保存探测结果到存储
@@ -894,6 +1226,7 @@ func (p *Prober) SaveResult(result *ProbeResult) (*storage.ProbeRecord, error) {
 		Service:     result.Service,
 		Channel:     result.Channel,
 		Model:       result.Model,
+		ModelID:     result.ModelID,
 		Status:      result.Status,
 		SubStatus:   result.SubStatus,
 		HttpCode:    result.HttpCode,

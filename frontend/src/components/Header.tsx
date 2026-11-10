@@ -6,6 +6,15 @@ import { useNavigate, useLocation } from 'react-router-dom';
 import { SUPPORTED_LANGUAGES, LANGUAGE_PATH_MAP, LANGUAGE_NAMES, isSupportedLanguage, type SupportedLanguage } from '../i18n';
 import { RefreshButton } from './RefreshButton';
 
+const LANG_SHORT: Record<SupportedLanguage, string> = {
+  'zh-CN': 'ZH',
+  'en-US': 'EN',
+  'ru-RU': 'RU',
+  'ja-JP': 'JA',
+};
+
+const GITHUB_REPO_URL = 'https://github.com/Ranshen1209/sakrylle-status';
+
 interface HeaderProps {
   stats: {
     total: number;
@@ -21,14 +30,6 @@ interface HeaderProps {
   onToggleAutoRefresh?: () => void;
   activeFiltersCount?: number;
 }
-
-// 语言缩写映射（用于切换器显示）
-const LANG_SHORT: Record<SupportedLanguage, string> = {
-  'zh-CN': 'ZH',
-  'en-US': 'EN',
-  'ru-RU': 'RU',
-  'ja-JP': 'JA',
-};
 
 export function Header({ stats, onFilterClick, onRefresh, loading, refreshCooldown, autoRefresh = true, onToggleAutoRefresh, activeFiltersCount = 0 }: HeaderProps) {
   const { t, i18n } = useTranslation();
@@ -109,7 +110,7 @@ export function Header({ stats, onFilterClick, onRefresh, loading, refreshCooldo
           </p>
         </div>
 
-        {/* 移动端：右上角操作区（语言 + 统计卡片） */}
+        {/* 移动端：右上角操作区（语言 + 主题 + 统计卡片） */}
         <div className="flex items-center gap-1 lg:hidden flex-shrink-0">
           {/* 语言切换器 - 点击展开 */}
           <div className="relative">
@@ -156,9 +157,8 @@ export function Header({ stats, onFilterClick, onRefresh, loading, refreshCooldo
             )}
           </div>
 
-          {/* GitHub 链接 */}
           <a
-            href="https://github.com/Ranshen1209/sakrylle-status"
+            href={GITHUB_REPO_URL}
             target="_blank"
             rel="noopener noreferrer"
             className="p-2 rounded-lg bg-elevated/50 hover:bg-muted/50 transition-all duration-200 focus-visible:ring-2 focus-visible:ring-accent/50 focus-visible:outline-none"
@@ -183,7 +183,7 @@ export function Header({ stats, onFilterClick, onRefresh, loading, refreshCooldo
           </div>
         </div>
 
-        {/* 桌面端：右侧完整操作区（语言 + 统计卡片） */}
+        {/* 桌面端：右侧完整操作区（语言 + 主题 + 分享 + 推荐 + 统计卡片） */}
         <div className="hidden lg:flex items-center gap-2 flex-shrink-0">
           {/* 语言切换器 - 点击/键盘展开 */}
           <div className="relative inline-block">
@@ -233,12 +233,11 @@ export function Header({ stats, onFilterClick, onRefresh, loading, refreshCooldo
             )}
           </div>
 
-          {/* GitHub 链接 */}
           <a
-            href="https://github.com/Ranshen1209/sakrylle-status"
+            href={GITHUB_REPO_URL}
             target="_blank"
             rel="noopener noreferrer"
-            className="p-2 rounded-lg bg-elevated/50 hover:bg-muted/50 transition-all duration-200 focus-visible:ring-2 focus-visible:ring-accent/50 focus-visible:outline-none"
+            className="p-2 rounded-lg bg-elevated/50 text-secondary hover:text-primary hover:bg-muted/50 transition-all duration-200 focus-visible:ring-2 focus-visible:ring-accent/50 focus-visible:outline-none"
             aria-label="GitHub"
             title="GitHub"
           >
@@ -261,7 +260,7 @@ export function Header({ stats, onFilterClick, onRefresh, loading, refreshCooldo
         </div>
       </div>
 
-      {/* 移动端：筛选/刷新按钮（960px 以下显示） */}
+      {/* 移动端：筛选/刷新 + 推荐按钮（960px 以下显示） */}
       <div className="flex items-center gap-1.5 min-[960px]:hidden">
         {/* 移动端：筛选按钮 */}
         {onFilterClick && (
@@ -289,8 +288,20 @@ export function Header({ stats, onFilterClick, onRefresh, loading, refreshCooldo
             onRefresh={onRefresh}
             onToggleAutoRefresh={onToggleAutoRefresh}
             size="sm"
+            showToggle={false}
           />
         )}
+
+        <a
+          href={GITHUB_REPO_URL}
+          target="_blank"
+          rel="noopener noreferrer"
+          className="ml-auto flex items-center gap-1 px-2 py-1 rounded-lg bg-elevated/50 text-secondary hover:text-primary hover:bg-muted/50 transition-all duration-200 text-xs focus-visible:ring-2 focus-visible:ring-accent/50 focus-visible:outline-none"
+          aria-label="GitHub"
+        >
+          <Github size={12} />
+          GitHub
+        </a>
       </div>
     </header>
   );

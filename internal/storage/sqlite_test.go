@@ -123,14 +123,10 @@ func TestInit_WALMode(t *testing.T) {
 	if err := store.db.QueryRow("PRAGMA journal_mode").Scan(&mode); err != nil {
 		t.Fatalf("PRAGMA journal_mode: %v", err)
 	}
-	// WAL mode is requested via DSN but the modernc.org/sqlite driver may
-	// report different mode depending on version; verify it is at least set.
-	mode = strings.ToLower(mode)
-	if mode != "wal" && mode != "delete" {
-		t.Errorf("unexpected journal mode %q", mode)
-	}
-	if mode != "wal" {
-		t.Logf("NOTE: journal_mode=%q (driver may not persist WAL via DSN param)", mode)
+	// WAL 经 DSN 的 _journal_mode 参数开启。modernc 是否认这个 mattn 风格参数取决于驱动版本，
+	// 不认时会静默回落到 delete 模式——升级驱动后这里必须变红，而不是只打一行日志。
+	if mode = strings.ToLower(mode); mode != "wal" {
+		t.Fatalf("journal_mode = %q, want wal (driver may have stopped honoring _journal_mode in the DSN)", mode)
 	}
 }
 
@@ -358,6 +354,117 @@ func TestGetHistoryBatch_EmptyKeys(t *testing.T) {
 	}
 	if len(got) != 0 {
 		t.Errorf("expected empty, got %d", len(got))
+	}
+}
+
+// --- *BatchByModelID（model_id 维度批量读，跨展示名历史连续）---
+
+// TestGetLatestBatchByModelIDKeysByInput 验证返回 map 以入参 ProbeHistoryKey 为键，
+// 通过 model_id 反查命中——即使 caller key 携带的展示名（Model）与 DB 行的展示名不同。
+func TestGetLatestBatchByModelIDKeysByInput(t *testing.T) {
+	s := newTestStore(t)
+	// row written under the NEW display name, same stable model_id
+	if err := s.SaveRecord(&ProbeRecord{Provider: "P", Service: "cc", Channel: "c", Model: "NewName", ModelID: "md_x", Status: 1, Timestamp: 2000}); err != nil {
+		t.Fatal(err)
+	}
+	// caller key carries a DIFFERENT display Model (e.g. an old/aliased name) — lookup must still hit, keyed by input
+	key := ProbeHistoryKey{ModelID: "md_x", Provider: "P", Service: "cc", Channel: "c", Model: "WhateverDisplayName"}
+	m, err := s.GetLatestBatchByModelID([]ProbeHistoryKey{key})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := m[key]; !ok {
+		t.Fatalf("returned map must be keyed by the INPUT key (not reconstructed from DB row). got keys: %v", m)
+	}
+	if m[key] == nil || m[key].Timestamp != 2000 {
+		t.Fatalf("wrong record for key")
+	}
+}
+
+func TestGetHistoryBatchByModelIDKeysByInput(t *testing.T) {
+	s := newTestStore(t)
+	if err := s.SaveRecord(&ProbeRecord{Provider: "P", Service: "cc", Channel: "c", Model: "NewName", ModelID: "md_x", Status: 1, Timestamp: 2000}); err != nil {
+		t.Fatal(err)
+	}
+	key := ProbeHistoryKey{ModelID: "md_x", Provider: "P", Service: "cc", Channel: "c", Model: "WhateverDisplayName"}
+	m, err := s.GetHistoryBatchByModelID([]ProbeHistoryKey{key}, time.Unix(0, 0))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(m[key]) != 1 {
+		t.Fatalf("history batch must key by input key; got %v", m)
+	}
+}
+
+func TestGetLatestBatchByModelID_EmptyKeys(t *testing.T) {
+	s := newTestStore(t)
+	m, err := s.GetLatestBatchByModelID(nil)
+	if err != nil {
+		t.Fatalf("GetLatestBatchByModelID: %v", err)
+	}
+	if m == nil || len(m) != 0 {
+		t.Fatalf("expected non-nil empty map, got %v", m)
+	}
+}
+
+func TestGetHistoryBatchByModelID_EmptyKeys(t *testing.T) {
+	s := newTestStore(t)
+	m, err := s.GetHistoryBatchByModelID(nil, time.Unix(0, 0))
+	if err != nil {
+		t.Fatalf("GetHistoryBatchByModelID: %v", err)
+	}
+	if m == nil || len(m) != 0 {
+		t.Fatalf("expected non-nil empty map, got %v", m)
+	}
+}
+
+// TestGetLatestBatchByModelID_MultiKey 多 model_id：各取最新、按 model_id 分桶，
+// 缺失 model_id 不出现在结果里，since 之前的历史不影响最新选取。
+func TestGetLatestBatchByModelID_MultiKey(t *testing.T) {
+	s := newTestStore(t)
+	keyA := ProbeHistoryKey{ModelID: "md_a", Provider: "P", Service: "cc", Channel: "c", Model: "A"}
+	keyB := ProbeHistoryKey{ModelID: "md_b", Provider: "P", Service: "cc", Channel: "c", Model: "B"}
+	keyMissing := ProbeHistoryKey{ModelID: "md_missing", Provider: "P", Service: "cc", Channel: "c", Model: "Z"}
+
+	mustSave(t, s, &ProbeRecord{Provider: "P", Service: "cc", Channel: "c", Model: "A", ModelID: "md_a", Status: 1, Timestamp: 1000})
+	mustSave(t, s, &ProbeRecord{Provider: "P", Service: "cc", Channel: "c", Model: "A", ModelID: "md_a", Status: 1, Timestamp: 3000})
+	mustSave(t, s, &ProbeRecord{Provider: "P", Service: "cc", Channel: "c", Model: "B", ModelID: "md_b", Status: 1, Timestamp: 1500})
+
+	m, err := s.GetLatestBatchByModelID([]ProbeHistoryKey{keyA, keyB, keyMissing})
+	if err != nil {
+		t.Fatalf("GetLatestBatchByModelID: %v", err)
+	}
+	if len(m) != 2 {
+		t.Fatalf("expected 2 keys, got %d: %v", len(m), m)
+	}
+	if m[keyA] == nil || m[keyA].Timestamp != 3000 {
+		t.Errorf("keyA: want ts 3000, got %v", m[keyA])
+	}
+	if m[keyB] == nil || m[keyB].Timestamp != 1500 {
+		t.Errorf("keyB: want ts 1500, got %v", m[keyB])
+	}
+	if _, ok := m[keyMissing]; ok {
+		t.Errorf("expected missing model_id to be absent from result")
+	}
+}
+
+// TestGetHistoryBatchByModelID_AscendingAndFilter 验证 since 过滤 + 升序返回。
+func TestGetHistoryBatchByModelID_AscendingAndFilter(t *testing.T) {
+	s := newTestStore(t)
+	key := ProbeHistoryKey{ModelID: "md_a", Provider: "P", Service: "cc", Channel: "c", Model: "A"}
+	for _, ts := range []int64{1000, 2000, 3000} {
+		mustSave(t, s, &ProbeRecord{Provider: "P", Service: "cc", Channel: "c", Model: "A", ModelID: "md_a", Status: 1, Timestamp: ts})
+	}
+
+	m, err := s.GetHistoryBatchByModelID([]ProbeHistoryKey{key}, time.Unix(1800, 0))
+	if err != nil {
+		t.Fatalf("GetHistoryBatchByModelID: %v", err)
+	}
+	if len(m[key]) != 2 { // 2000, 3000
+		t.Fatalf("want 2 records after since, got %d", len(m[key]))
+	}
+	if m[key][0].Timestamp >= m[key][1].Timestamp {
+		t.Errorf("records not ascending: %d >= %d", m[key][0].Timestamp, m[key][1].Timestamp)
 	}
 }
 
@@ -653,6 +760,74 @@ func TestSaveStatusEvent_Idempotent(t *testing.T) {
 	}
 }
 
+// --- model_id column and index ---
+
+func TestInitAddsModelIDColumnAndIndex(t *testing.T) {
+	s := newTestStore(t)
+
+	// model_id column must exist
+	cols := columnNames(t, s.db, "probe_history")
+	if !cols["model_id"] {
+		t.Fatal("probe_history 缺 model_id 列")
+	}
+
+	// partial index must exist
+	if !sqliteObjectExists(t, s.db, "index", "idx_probe_history_mid_ts") {
+		t.Fatal("缺 idx_probe_history_mid_ts 索引")
+	}
+}
+
+// --- model_id write path ---
+
+func TestSaveRecordPersistsModelID(t *testing.T) {
+	s := newTestStore(t)
+	rec := &ProbeRecord{Provider: "P", Service: "cc", Channel: "c", Model: "Opus", ModelID: "md_test-1", Status: 1, Timestamp: 1000}
+	if err := s.SaveRecord(rec); err != nil {
+		t.Fatal(err)
+	}
+	var got sql.NullString
+	if err := s.db.QueryRow(`SELECT model_id FROM probe_history WHERE provider='P'`).Scan(&got); err != nil {
+		t.Fatal(err)
+	}
+	if !got.Valid || got.String != "md_test-1" {
+		t.Fatalf("model_id 未持久化，got %#v", got)
+	}
+}
+
+// --- model_id 读路径 ---
+
+func TestGetHistoryByModelIDSurvivesRename(t *testing.T) {
+	s := newTestStore(t)
+	if err := s.SaveRecord(&ProbeRecord{Provider: "P", Service: "cc", Channel: "c", Model: "OldName", ModelID: "md_x", Status: 1, Timestamp: 1000}); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.SaveRecord(&ProbeRecord{Provider: "P", Service: "cc", Channel: "c", Model: "NewName", ModelID: "md_x", Status: 1, Timestamp: 2000}); err != nil {
+		t.Fatal(err)
+	}
+	got, err := s.GetHistoryByModelID("md_x", time.Unix(0, 0))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 2 {
+		t.Fatalf("model_id 应跨展示名连续，want 2 got %d", len(got))
+	}
+	latest, err := s.GetLatestByModelID("md_x")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if latest == nil || latest.Timestamp != 2000 {
+		t.Fatalf("GetLatestByModelID 应返回最新行，got %#v", latest)
+	}
+	// 限量
+	lim, err := s.GetHistoryWithLimitByModelID("md_x", time.Unix(0, 0), 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(lim) != 1 {
+		t.Fatalf("limit=1 应返回 1 行，got %d", len(lim))
+	}
+}
+
 // --- WithContext ---
 
 func TestWithContext(t *testing.T) {
@@ -674,5 +849,135 @@ func TestWithContext(t *testing.T) {
 	err := ctxStore.SaveRecord(rec(key, 2000))
 	if err == nil {
 		t.Log("SaveRecord after cancel did not error (may be driver-specific)")
+	}
+}
+
+// --- BackfillProbeHistoryModelIDs ---
+
+func TestBackfillProbeHistoryModelIDs(t *testing.T) {
+	s := newTestStore(t)
+	// legacy row with no model_id (insert raw so model_id stays NULL)
+	if _, err := s.db.Exec(`INSERT INTO probe_history(provider,service,channel,model,status,latency,timestamp) VALUES('P','cc','c','Opus',1,0,1000)`); err != nil {
+		t.Fatal(err)
+	}
+	maps := []ModelIDMigrationMapping{{Provider: "P", Service: "cc", Channel: "c", Model: "Opus", ModelID: "md_x"}}
+	if err := s.BackfillProbeHistoryModelIDs(maps); err != nil {
+		t.Fatal(err)
+	}
+	var got sql.NullString
+	if err := s.db.QueryRow(`SELECT model_id FROM probe_history WHERE provider='P'`).Scan(&got); err != nil {
+		t.Fatal(err)
+	}
+	if !got.Valid || got.String != "md_x" {
+		t.Fatalf("legacy 行未回填，got %#v", got)
+	}
+	// idempotent rerun: no error, no change
+	if err := s.BackfillProbeHistoryModelIDs(maps); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestBackfillRejectsAmbiguousMapping(t *testing.T) {
+	s := newTestStore(t)
+	maps := []ModelIDMigrationMapping{
+		{Provider: "P", Service: "cc", Channel: "c", Model: "Opus", ModelID: "md_x"},
+		{Provider: "P", Service: "cc", Channel: "c", Model: "Opus", ModelID: "md_y"},
+	}
+	if err := s.BackfillProbeHistoryModelIDs(maps); err == nil {
+		t.Fatal("同 (p,s,c,model) 映射到多 id 必须 fail-fast")
+	}
+	// and it must NOT have written anything
+}
+
+// openStoreAt 在给定路径打开一个真实 *SQLiteStorage 并跑完 Init（含迁移），
+// 用于对预置的旧版 schema 做迁移测试（newTestStore 用随机临时路径、无法预置）。
+func openStoreAt(t *testing.T, path string) *SQLiteStorage {
+	t.Helper()
+	store, err := NewSQLiteStorage(path)
+	if err != nil {
+		t.Fatalf("NewSQLiteStorage: %v", err)
+	}
+	if err := store.Init(); err != nil {
+		t.Fatalf("Init: %v", err)
+	}
+	t.Cleanup(func() { _ = store.Close() })
+	return store
+}
+
+func TestSQLite_MonitorOverride_QualityFieldsRoundTrip(t *testing.T) {
+	s := newTestStore(t)
+	rec := MonitorOverrideRecord{
+		Key:                   MonitorKey{Provider: "Acme", Service: "cc", Channel: "Acme-CC", Model: "claude-opus"},
+		Board:                 "secondary",
+		BoardReason:           "quality_hardfail",
+		QualityLatched:        true,
+		QualityRecoveryCount:  2,
+		QualityTriggerModels:  "claude-opus,claude-sonnet",
+		QualityLastGeneration: 42,
+		AvailabilityLatched:   false,
+	}
+	if err := s.ReplaceMonitorOverrides([]MonitorOverrideRecord{rec}); err != nil {
+		t.Fatalf("replace: %v", err)
+	}
+	got, err := s.ListMonitorOverrides()
+	if err != nil {
+		t.Fatalf("list: %v", err)
+	}
+	if len(got) != 1 {
+		t.Fatalf("len = %d, want 1", len(got))
+	}
+	g := got[0]
+	if g.BoardReason != "quality_hardfail" || !g.QualityLatched || g.QualityRecoveryCount != 2 ||
+		g.QualityTriggerModels != "claude-opus,claude-sonnet" || g.QualityLastGeneration != 42 || g.AvailabilityLatched {
+		t.Fatalf("round-trip mismatch: %+v", g)
+	}
+}
+
+func TestSQLite_OverrideMigration_AddsColumnsIdempotentAndBackfills(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "mig.db")
+	// build the OLD (pre-feature) schema by hand, insert legacy rows
+	raw, err := sql.Open("sqlite", "file:"+path+"?_journal_mode=WAL")
+	if err != nil {
+		t.Fatalf("open raw: %v", err)
+	}
+	mustExecRaw := func(q string) {
+		if _, err := raw.Exec(q); err != nil {
+			t.Fatalf("exec %q: %v", q, err)
+		}
+	}
+	mustExecRaw(`CREATE TABLE monitor_overrides (
+		provider TEXT NOT NULL, service TEXT NOT NULL, channel TEXT NOT NULL DEFAULT '',
+		model TEXT NOT NULL DEFAULT '', board TEXT NOT NULL DEFAULT '', cold_reason TEXT NOT NULL DEFAULT '',
+		sponsor_level TEXT NOT NULL DEFAULT '', created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL,
+		PRIMARY KEY (provider, service, channel, model))`)
+	mustExecRaw(`INSERT INTO monitor_overrides VALUES ('Acme','cc','Acme-CC','m','secondary','','',1,1)`)
+	mustExecRaw(`INSERT INTO monitor_overrides VALUES ('Beta','cc','Beta-CC','m','cold','低可用率','',1,1)`)
+	raw.Close()
+
+	// open via the real storage path -> triggers migration + one-time backfill
+	s := openStoreAt(t, path)
+	got, err := s.ListMonitorOverrides()
+	if err != nil {
+		t.Fatalf("list after migration: %v", err)
+	}
+	if len(got) != 2 {
+		t.Fatalf("legacy rows lost: %+v", got)
+	}
+	for _, r := range got {
+		switch r.Board {
+		case "secondary":
+			if !r.AvailabilityLatched {
+				t.Fatalf("secondary must backfill availability_latched=true: %+v", r)
+			}
+		case "cold":
+			if r.AvailabilityLatched {
+				t.Fatalf("cold must NOT be availability_latched: %+v", r)
+			}
+		}
+	}
+	// second open is idempotent (no duplicate-column error, backfill not re-run)
+	s2 := openStoreAt(t, path)
+	if _, err := s2.ListMonitorOverrides(); err != nil {
+		t.Fatalf("second init not idempotent: %v", err)
 	}
 }

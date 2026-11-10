@@ -1,4 +1,6 @@
 {
+  "self_serve_visible": false,
+  "model_vendor": "openai",
   "model": "Image",
   "request_model": "gpt-image-2",
   "url": "{{BASE_URL}}/v1/models",

@@ -108,11 +108,15 @@ export interface MonitorResult {
   price_max?: number;                  // 参考倍率
   listed_days?: number;                // 收录天数
   channel: string;                     // 业务通道标识
+  channel_id?: string;                 // 通道稳定 id（跨产品 join 锚，可选/旧后端缺失）
   channel_name?: string;               // Channel 显示名称（可选）
   model?: string;                      // 模型展示名（可选）
   request_model?: string;              // 实际请求模型 ID（可选）
+  model_vendor?: string;               // 模型厂商受控 code（后端 internal/modelvendor 词表；未回填时缺失）
   board: BoardValue;                   // 板块：hot/secondary/cold
   cold_reason?: string;                // 冷板原因（仅 cold 有值）
+  board_reason?: string;               // 移板机器码（如 "quality_hardfail"），前端本地化
+  board_reason_models?: string;        // 触发质量移板的模型名（逗号连接）
   probe_url?: string;                  // 探测端点 URL（脱敏后）
   template_name?: string;              // 请求体模板名称（如有）
   interval_ms?: number;                // 监测间隔（毫秒，可选兼容旧版本）
@@ -128,6 +132,11 @@ export interface ApiResponse {
     timeline_mode?: 'raw' | 'aggregated';  // 时间线模式：raw=原始记录，aggregated=聚合数据
     slow_latency_ms?: number;  // 慢延迟阈值（毫秒），用于延迟颜色渐变
     enable_annotations?: boolean;   // 注解系统总开关（默认 true）
+    hide_price_column?: boolean;    // 运行时控制：是否隐藏价格列（默认 false / 旧后端缺失）
+    hide_category_filter?: boolean; // 运行时控制：是否隐藏分类筛选器（默认 false / 旧后端缺失）
+    hide_vendor_filter?: boolean;   // 运行时控制：是否隐藏厂商筛选器（默认 false / 旧后端缺失）
+    hide_drawing_column?: boolean;  // 运行时控制：是否隐藏画作列（默认 false / 旧后端缺失）
+    rpdiag_enabled?: boolean;       // 质量列/diag 外链入口总开关；私有部署未接 rpdiag 时为 false（旧后端缺失→fail-open 默认显示）
     sponsor_pin?: SponsorPinConfig;  // 赞助商置顶配置
     boards?: BoardsConfig;     // 板块配置
     board_counts?: BoardCounts; // 各板块通道数量
@@ -174,16 +183,22 @@ export interface ProcessedMonitorData {
   listedDays?: number | null;          // 收录天数
   channel?: string;                    // 业务通道标识
   channelName?: string;                // Channel 显示名称
+  channelId?: string;                  // 通道稳定 id（跨产品 join 锚，Plan A 经 /api/status 暴露；旧后端/inline 缺失）
+  /** 各层非空厂商 code，规范化去重并保留首次出现顺序。 */
+  modelVendors?: string[];
   board: BoardValue;                   // 板块：hot/secondary/cold
   coldReason?: string;                 // 冷板原因（仅 cold 有值）
+  boardReason?: string;                // 移板机器码（如 "quality_hardfail"），前端本地化
+  boardReasonModels?: string;          // 触发质量移板的模型名（逗号连接）
   probeUrl?: string;                   // 探测端点 URL（脱敏后）
   templateName?: string;               // 请求体模板名称（如有）
   intervalMs?: number;                 // 监测间隔（毫秒，可选）
   slowLatencyMs?: number;              // 慢请求阈值（毫秒，per-monitor）
   pinned?: boolean;                    // 是否为置顶项（由排序逻辑标记）
+  qualityScore?: number | null;        // rpdiag 通道质量排名分（max_score=活跃 model 排名贡献均值，fresh 取 30d 均值），sort 前由 useMonitorData 注入；null 表示未上报或 rpdiag 未启用
   isMultiModel: boolean;               // 是否为多模型监测组
   layers?: MonitorLayer[];             // 原始分层数据（仅多模型组有值）
-  modelEntries?: Array<{ model: string; requestModel: string }>; // 模型展示名与实际请求模型映射
+  modelEntries?: Array<{ model: string; requestModel: string; vendor?: string }>; // 模型展示名与实际请求模型映射
   history: Array<{
     index: number;
     status: StatusKey;
@@ -293,6 +308,7 @@ export interface StatusPoint {
 export interface MonitorLayer {
   model: string;                  // 模型名称
   request_model?: string;         // 实际请求模型 ID（可选）
+  model_vendor?: string;          // 模型厂商受控 code（后端 internal/modelvendor 词表；未回填时缺失）
   layer_order: number;            // 层序号：0=父，1+=子
   current_status: StatusPoint;    // 当前状态点
   timeline: TimePoint[];          // 时间线数据
@@ -315,9 +331,12 @@ export interface MonitorGroup {
   price_max?: number;
   listed_days?: number;
   channel: string;
+  channel_id?: string;            // 通道稳定 id（跨产品 join 锚，多模型组级；旧后端缺失）
   channel_name?: string;
   board: BoardValue;
   cold_reason?: string;
+  board_reason?: string;
+  board_reason_models?: string;
   probe_url?: string;
   template_name?: string;
   interval_ms?: number;

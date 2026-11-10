@@ -37,7 +37,7 @@ type SponsorPinConfig struct {
 	// 是否启用置顶功能（默认 true）
 	Enabled *bool `yaml:"enabled" json:"enabled"`
 
-	// 最多置顶数量（默认 3，0 表示禁用）
+	// 最多置顶数量（默认 10；0 或负数回退为默认值，禁用置顶用 enabled: false）
 	MaxPinned int `yaml:"max_pinned" json:"max_pinned"`
 
 	// 最低可用率要求（默认 95.0，百分比 0-100）
@@ -55,8 +55,10 @@ func (c *SponsorPinConfig) IsEnabled() bool {
 	return *c.Enabled
 }
 
-// BoardAutoMoveConfig 基于 7 天可用率自动在 hot/secondary/cold 间移板的配置。
-// 自动冷板为粘性状态，不会自动恢复，需人工设置 auto_cold_exempt 解除。
+// BoardAutoMoveConfig 基于 7 天可用率自动移板的配置。
+// 语义：配置板位（board 字段）是"锚点/天花板"，自动移板只在锚点及以下浮动，绝不向上越板——
+// 配 board=hot 的通道可在 hot↔secondary 间双向迟滞、并可冷板；配 board=secondary 的通道
+// 永不自动升 hot，只会在可用率过低时冷板。自动冷板为粘性状态，需人工设置 auto_cold_exempt 解除。
 type BoardAutoMoveConfig struct {
 	// 是否启用自动移板（默认 false）
 	Enabled bool `yaml:"enabled" json:"enabled"`
@@ -65,10 +67,11 @@ type BoardAutoMoveConfig struct {
 	// 自动冷板是 sticky 的，不会自动恢复，需通过 auto_cold_exempt 手动解除
 	ThresholdCold float64 `yaml:"threshold_cold" json:"threshold_cold"`
 
-	// 降级阈值：hot 板可用率低于此值 → secondary（默认 50.0，百分比 0-100）
+	// 降级阈值：board=hot 的通道可用率低于此值 → secondary（默认 50.0，百分比 0-100）
 	ThresholdDown float64 `yaml:"threshold_down" json:"threshold_down"`
 
-	// 升级阈值：secondary 板可用率达到此值 → hot（默认 55.0，高于 down 以防抖）
+	// 恢复阈值：board=hot 被降级到 secondary 后，可用率回到此值 → 升回 hot（默认 55.0，高于 down 以防抖）。
+	// 仅作用于配置板位为 hot 的通道的恢复；board=secondary 的通道不受此阈值影响（锚点不向上越板）。
 	ThresholdUp float64 `yaml:"threshold_up" json:"threshold_up"`
 
 	// 评估间隔（默认 "30m"）
@@ -115,6 +118,18 @@ type ChangeRequestConfig struct {
 
 	// 每 IP 每天最大提交数（默认 3）
 	MaxPerIPPerDay int `yaml:"max_per_ip_per_day" json:"-"`
+
+	// 已公开泄露 API Key 的拒绝名单文件名（主配置目录下的直接子文件，空值=功能关闭）。
+	// 文件格式与哈希空间见 revoked_keys.go。
+	RevokedKeyFile string `yaml:"revoked_key_file" json:"-"`
+
+	// 名单预期条目数。必须与文件去重后的条目数一致，否则整次配置加载失败——
+	// 这是唯一能发现「名单被部分写入/截断」的手段（截断后的前缀仍是合法摘要行）。
+	RevokedKeyCount int `yaml:"revoked_key_count" json:"-"`
+
+	// 加载后的运行时名单（sha256 hex 集合）。由 loadRevokedKeyFile 填充，不参与 YAML/JSON 序列化。
+	// 加载完成后只读，可在热更新的新旧配置间安全共享。
+	RevokedKeySHA256 map[string]struct{} `yaml:"-" json:"-"`
 }
 
 // BoardsConfig 热板/冷板功能配置
@@ -123,6 +138,6 @@ type BoardsConfig struct {
 	// 是否启用热板/冷板功能（默认 false，保持向后兼容）
 	Enabled bool `yaml:"enabled" json:"enabled"`
 
-	// 自动移板配置（基于 7 天可用率在 hot/secondary 间切换）
+	// 自动移板配置（基于 7 天可用率，在配置板位及以下浮动；详见 BoardAutoMoveConfig）
 	AutoMove BoardAutoMoveConfig `yaml:"auto_move" json:"auto_move"`
 }

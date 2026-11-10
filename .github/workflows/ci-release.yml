@@ -3,6 +3,18 @@ name: CI & Release
 on:
   push:
     branches: [main]
+    # 纯文档改动不触发整条流水线：**.md / docs/** 不进 //go:embed 的 frontend/dist
+    # （embed 只吃 dist，见 internal/api/server.go），不影响二进制；且 .releaserc 里
+    # docs/test/ci/style 本就 release:false，跑满 CI+docker+release 评估纯白烧 ~4min。
+    # 仅当本次 push 的全部改动文件都匹配时才跳过——混合改动（含任一非文档文件）照常跑。
+    # 副作用：纯文档的 chore/refactor/perf 等（release:true 类型）只动 .md 时也被跳过→不发版；
+    # 文档无产物变化本不该 bump 镜像版本，需要时同 push 带一个代码文件即可。
+    # 只加在 push（直推 main 的实际流程）；不加 pull_request，避免必需检查 pending 卡合并。
+    paths-ignore:
+      - '**.md'
+      - 'docs/**'
+  pull_request:
+    branches: [main]
   workflow_dispatch:
 
 concurrency:
@@ -20,20 +32,28 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v6
+        uses: actions/checkout@v7
         with:
           fetch-depth: 0  # commitlint + semantic-release 需要完整历史
 
       - name: Set up Go
-        uses: actions/setup-go@v5
+        uses: actions/setup-go@v7
         with:
-          go-version-file: 'go.mod'
+          # 跟随最新 1.27.x（与生产 Dockerfile golang:1.27-alpine 一致），
+          # 确保 govulncheck 跑在含安全补丁的工具链上。
+          # 升 Dockerfile 基础镜像时**必须同步这里**，否则漏洞闸不再跑在生产等价工具链上。
+          go-version: '1.27'
+          # check-latest 必开：否则 setup-go 优先用 runner 预装/缓存的 Go（常滞后一个
+          # 补丁，如 1.25.10），而新 stdlib CVE（GO-2026-5037/5039，fixed in 1.25.11）
+          # 一发布 govulncheck 立即判红、阻断所有 release——这是 toolchain-lag race，
+          # 与代码无关。check-latest=true 强制从 go.dev manifest 取最新匹配补丁，根治。
+          check-latest: true
           cache: true
 
       - name: Set up Node.js
-        uses: actions/setup-node@v6
+        uses: actions/setup-node@v7
         with:
-          node-version: '20'
+          node-version: '24'
           cache: 'npm'
           cache-dependency-path: frontend/package-lock.json
 
@@ -87,6 +107,10 @@ jobs:
       - name: Go coverage report
         run: go tool cover -func=coverage.out
 
+      # 并发敏感的包单独跑竞态检测（调度器派发/在途登记、admin 鉴权限速与状态缓存）
+      - name: Go race (scheduler, api)
+        run: go test -race -count=1 ./internal/scheduler/ ./internal/api/
+
       # 前端 lint
       - name: Frontend lint
         working-directory: frontend
@@ -95,6 +119,28 @@ jobs:
       - name: Frontend test
         working-directory: frontend
         run: npm run test -- --run
+
+      # 依赖/标准库漏洞闸：跑在 1.25.x（生产等价）工具链上，防安全回归。
+      # 不放进本地 Makefile——开发机若用更新的 Go 小版本会误报与生产无关的告警。
+      - name: Vulnerability scan (govulncheck)
+        run: |
+          go install golang.org/x/vuln/cmd/govulncheck@latest
+          govulncheck ./...
+
+      # 密钥泄露闸：本仓库曾把带真实中转商 API Key 的配置提交进 git 历史，
+      # GitHub 自带扫描只认官方厂商格式、对自定义格式全盲，故自建这道闸。
+      # 扫**检出的工作树**（不扫历史——历史里那两处泄露已成事实，扫历史会让 CI 永久红）；
+      # 干净检出里没有 monitors.d/、config.yaml、testenv/ 这些 gitignore 的本地凭据文件。
+      # 加白规则与「这道闸对当年那份泄露报 102 条」的实证见 .gitleaks.toml。
+      - name: Secret scan (gitleaks)
+        run: |
+          set -euo pipefail
+          GITLEAKS_VERSION="8.30.1"
+          curl -fsSL -o /tmp/gitleaks.tar.gz \
+            "https://github.com/gitleaks/gitleaks/releases/download/v${GITLEAKS_VERSION}/gitleaks_${GITLEAKS_VERSION}_linux_x64.tar.gz"
+          tar -xzf /tmp/gitleaks.tar.gz -C /tmp gitleaks
+          # --redact：命中内容绝不进 CI 日志（公开仓库的 Actions 日志任何人可读）
+          /tmp/gitleaks dir --redact --no-banner --config .gitleaks.toml --exit-code 1 .
 
       - name: Test Summary
         run: |
@@ -118,25 +164,32 @@ jobs:
 
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v6
+        uses: actions/checkout@v7
         with:
           fetch-depth: 0
           # 保持默认 persist-credentials: true，semantic-release 需要推 tag
 
       - name: Set up Node.js
-        uses: actions/setup-node@v6
+        uses: actions/setup-node@v7
         with:
-          node-version: '20'
+          node-version: '24'
 
       - name: Semantic Release
         id: semantic
-        uses: cycjimmy/semantic-release-action@v6
+        uses: cycjimmy/semantic-release-action@v8
         with:
+          # 只装 semantic-release **没有**自带的那一个：commit-analyzer / release-notes-generator /
+          # github 三个插件本就是 semantic-release 的依赖，由它按互相兼容的版本装好；把它们再
+          # 列一遍只是多开三条各自浮动 major 的漂移通道。
+          #
+          # preset 必须钉版本：2026-08 起 conventional-changelog-conventionalcommits 浮到 10.x，
+          # 它换用 @conventional-changelog/template 且要求 conventional-changelog-writer@9+，
+          # 而 release-notes-generator@14 依赖的是 writer@^8 —— 于是 release job 报
+          # `Missing helper: ... requires conventional-changelog-writer@9 or newer`，任何 commit
+          # 推上来都红、连着两次发不出版本号。9.x 是与 writer@8 配套的最后一个 major。
+          # 升级时机：等 release-notes-generator 依赖的 writer 进到 9，再把这里抬到 10。
           extra_plugins: |
-            @semantic-release/commit-analyzer
-            @semantic-release/release-notes-generator
-            @semantic-release/github
-            conventional-changelog-conventionalcommits
+            conventional-changelog-conventionalcommits@9
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
@@ -160,10 +213,10 @@ jobs:
 
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v6
+        uses: actions/checkout@v7
 
       - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v3
+        uses: docker/setup-buildx-action@v4
 
       - name: Log in to GitHub Container Registry
         uses: docker/login-action@v4
@@ -184,10 +237,11 @@ jobs:
           echo "build_time=${BUILD_TIME}" >> $GITHUB_OUTPUT
 
       - name: Build and push Docker image (:latest)
-        uses: docker/build-push-action@v5
+        uses: docker/build-push-action@v7
         with:
           context: .
           platforms: linux/amd64
+          provenance: false
           push: true
           tags: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:latest
           labels: |
@@ -197,6 +251,7 @@ jobs:
             VERSION=${{ steps.info.outputs.version }}
             GIT_COMMIT=${{ steps.info.outputs.git_commit }}
             BUILD_TIME=${{ steps.info.outputs.build_time }}
+            VITE_HIDE_PRICE_COLUMN=${{ vars.HIDE_PRICE_COLUMN }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
 
@@ -218,7 +273,7 @@ jobs:
 
     steps:
       - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v3
+        uses: docker/setup-buildx-action@v4
 
       - name: Log in to GitHub Container Registry
         uses: docker/login-action@v4

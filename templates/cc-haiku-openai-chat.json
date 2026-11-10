@@ -1,4 +1,6 @@
 {
+  "self_serve_visible": false,
+  "model_vendor": "anthropic",
   "model": "Claude Haiku 4.5",
   "request_model": "claude-haiku-4-5-20251001",
   "url": "{{BASE_URL}}/v1/chat/completions",
@@ -13,7 +15,10 @@
     "max_tokens": 16,
     "stream": false,
     "messages": [
-      {"role": "user", "content": "{{PROMPT}}"}
+      {
+        "role": "user",
+        "content": "{{PROMPT}}"
+      }
     ]
   },
   "response": {

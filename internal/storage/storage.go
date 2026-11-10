@@ -28,13 +28,14 @@ type ProbeRecord struct {
 	Provider    string
 	Service     string
 	Channel     string    // 业务通道标识
-	Model       string    // 模型标识（可为空，兼容旧数据）
+	Model       string    // 模型展示名（可为空，兼容旧数据）
+	ModelID     string    // 稳定模型 id（md_<uuidv4>），为空表示尚未回填
 	Status      int       // 1=绿, 0=红, 2=黄
 	SubStatus   SubStatus // 细分状态（黄色/红色原因）
 	HttpCode    int       // HTTP 状态码（0 表示非 HTTP 错误，如网络错误）
 	Latency     int       // ms
 	Timestamp   int64     // Unix时间戳
-	ErrorDetail string    // 失败摘要（仅 status=0 时写入，截断前 512 字节）
+	ErrorDetail string    // 失败摘要（仅 status=0 时写入，形态见 monitor.buildFailureSnippet）
 }
 
 // TimePoint 时间轴数据点（用于前端展示）
@@ -80,6 +81,16 @@ type ChannelMigrationMapping struct {
 	Channel  string
 }
 
+// ModelIDMigrationMapping 把一个 (provider,service,channel,model) 业务键映射到稳定 model_id，
+// 供启动期回填 legacy probe_history 行。
+type ModelIDMigrationMapping struct {
+	Provider string
+	Service  string
+	Channel  string
+	Model    string
+	ModelID  string
+}
+
 // MonitorKey 监测项唯一键（provider/service/channel/model）
 // 用于批量查询时作为 map 的 key，避免字符串拼接的歧义和冲突
 type MonitorKey struct {
@@ -97,8 +108,15 @@ type MonitorOverrideRecord struct {
 	Board        string
 	ColdReason   string
 	SponsorLevel string // config.SponsorLevel 的字符串表示，避免 storage → config 依赖
-	CreatedAt    int64
-	UpdatedAt    int64
+	// —— 质量移板机器字段（Task 4）——
+	BoardReason           string // 移板机器码，如 quality_hardfail
+	QualityLatched        bool   // 质量驱动移板已闩锁
+	QualityRecoveryCount  int    // 质量恢复评估计数
+	QualityTriggerModels  string // 触发质量移板的模型名（逗号连接）
+	QualityLastGeneration uint64 // 上次质量评估代次（存 int64/BIGINT，真实值不超 2^63）
+	AvailabilityLatched   bool   // 可用率驱动移板已闩锁
+	CreatedAt             int64
+	UpdatedAt             int64
 }
 
 // ===== 状态订阅通知（事件）相关类型 =====
@@ -196,14 +214,26 @@ type EventFilters struct {
 	Types    []EventType // 按事件类型过滤（可选，如 ["DOWN", "UP"]）
 }
 
+// ProbeHistoryKey 是 probe_history 的稳定身份键（model_id 维度）。
+// ModelID 是查询/分桶键；Provider/Service/Channel/Model 仅供日志与返回 map 对齐当前展示名。
+type ProbeHistoryKey struct {
+	ModelID  string
+	Provider string
+	Service  string
+	Channel  string
+	Model    string
+}
+
 // ===== 领域子接口 =====
 
 // RecordStorage 探测记录的读写操作
 //
 // 索引依赖说明：
-// - GetLatest 和 GetHistory 的性能依赖于 idx_probe_history_pscm_ts_cover 覆盖索引
-// - 两个方法都必须包含完整的 (provider, service, channel, model) 等值条件
-// - ⚠️ 如果新增不带 channel/model 参数的查询方法，需要重新评估索引策略
+//   - GetLatest 和 GetHistory 的性能依赖于 idx_probe_history_pscm_ts_cover 覆盖索引
+//   - 两个方法都必须包含完整的 (provider, service, channel, model) 等值条件
+//   - GetLatestByModelID / GetHistoryByModelID / GetHistoryWithLimitByModelID 依赖
+//     idx_probe_history_mid_ts 部分索引（WHERE model_id IS NOT NULL）
+//   - ⚠️ 如果新增不带 channel/model 参数的查询方法，需要重新评估索引策略
 type RecordStorage interface {
 	// SaveRecord 保存探测记录
 	SaveRecord(record *ProbeRecord) error
@@ -219,11 +249,32 @@ type RecordStorage interface {
 	// limit <= 0 时回退到 200；上限 clamp 由上层 handler 负责。
 	GetHistoryWithLimit(provider, service, channel, model string, since time.Time, limit int) ([]*ProbeRecord, error)
 
+	// GetLatestByModelID 按 model_id 获取最新一条记录，跨展示名（model 字段）历史连续。
+	// 返回 nil, nil 表示无记录。
+	GetLatestByModelID(modelID string) (*ProbeRecord, error)
+
+	// GetHistoryByModelID 按 model_id 获取 since 之后的历史记录（时间升序），跨展示名历史连续。
+	GetHistoryByModelID(modelID string, since time.Time) ([]*ProbeRecord, error)
+
+	// GetHistoryWithLimitByModelID 按 model_id 获取 since 之后最近 limit 条记录（timestamp DESC + id DESC）。
+	// 与 GetHistoryByModelID 不同，该方法返回值包含 ErrorDetail 字段，返回倒序（最新在前）。
+	// limit <= 0 时回退到 200。
+	GetHistoryWithLimitByModelID(modelID string, since time.Time, limit int) ([]*ProbeRecord, error)
+
 	// GetLatestBatch 批量获取每个监测项的最新记录
 	GetLatestBatch(keys []MonitorKey) (map[MonitorKey]*ProbeRecord, error)
 
 	// GetHistoryBatch 批量获取多个监测项的历史记录（时间范围）
 	GetHistoryBatch(keys []MonitorKey, since time.Time) (map[MonitorKey][]*ProbeRecord, error)
+
+	// GetLatestBatchByModelID 按 model_id 批量获取每个监测项的最新记录，跨展示名历史连续。
+	// 返回 map 以入参 ProbeHistoryKey 为键（通过 model_id 反查命中），
+	// 绝不用 DB 行的展示名列重建 key——改名后 DB 行 model 是新名，与 caller key 不等会静默丢失。
+	GetLatestBatchByModelID(keys []ProbeHistoryKey) (map[ProbeHistoryKey]*ProbeRecord, error)
+
+	// GetHistoryBatchByModelID 按 model_id 批量获取多个监测项的历史记录（时间范围），跨展示名历史连续。
+	// 返回 map 同样以入参 ProbeHistoryKey 为键（语义见 GetLatestBatchByModelID）。
+	GetHistoryBatchByModelID(keys []ProbeHistoryKey, since time.Time) (map[ProbeHistoryKey][]*ProbeRecord, error)
 }
 
 // EventStorage 状态变更检测的持久化操作
@@ -267,6 +318,10 @@ type RetentionStorage interface {
 type MigrationStorage interface {
 	// MigrateChannelData 将 channel 为空的历史记录迁移到最新配置
 	MigrateChannelData(mappings []ChannelMigrationMapping) error
+
+	// BackfillProbeHistoryModelIDs 按映射把 model_id IS NULL 的历史行回填为对应 model_id（分批、幂等）。
+	// 若同一 (provider,service,channel,model) 映射到多个不同 model_id（歧义），在写库前返回错误、不做任何写入。
+	BackfillProbeHistoryModelIDs(mappings []ModelIDMigrationMapping) error
 }
 
 // OverrideStorage 自动移板 runtime override 的持久化操作。
@@ -346,6 +401,11 @@ type TimelineAggStorage interface {
 	// - 仅聚合 (since, endTime] 的数据，严格排除 timestamp==since 的边界数据
 	// - 聚合窗口由 bucketCount + bucketWindow 决定（与 api.determineBucketStrategy 一致）
 	GetTimelineAggBatch(keys []MonitorKey, since, endTime time.Time, bucketCount int, bucketWindow time.Duration, timeFilter *DailyTimeFilter) (map[MonitorKey][]AggBucketRow, error)
+
+	// GetTimelineAggBatchByModelID 按 model_id 批量获取时间轴 bucket 聚合结果（时间范围），跨展示名历史连续。
+	// 语义与 GetTimelineAggBatch 完全一致，仅查询/分桶键从四元组改为 model_id；
+	// 返回 map 以入参 ProbeHistoryKey 为键（通过 model_id 反查命中）。
+	GetTimelineAggBatchByModelID(keys []ProbeHistoryKey, since, endTime time.Time, bucketCount int, bucketWindow time.Duration, timeFilter *DailyTimeFilter) (map[ProbeHistoryKey][]AggBucketRow, error)
 }
 
 // ArchiveStorage 为"历史数据归档"提供的可选能力接口

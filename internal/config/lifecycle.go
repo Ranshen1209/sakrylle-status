@@ -121,6 +121,9 @@ func resolveTemplateForMonitor(m *ServiceConfig, configDir string) error {
 	if strings.TrimSpace(m.RequestModel) == "" && tmpl.RequestModel != "" {
 		m.RequestModel = tmpl.RequestModel
 	}
+	if strings.TrimSpace(m.ModelVendor) == "" && tmpl.ModelVendor != "" {
+		m.ModelVendor = tmpl.ModelVendor
+	}
 
 	// 仅填充为空的字段（config > template）
 	if m.Method == "" {
@@ -242,33 +245,43 @@ func (c *AppConfig) clone() *AppConfig {
 	}
 
 	clone := &AppConfig{
-		Interval:                c.Interval,
-		IntervalDuration:        c.IntervalDuration,
-		SlowLatency:             c.SlowLatency,
-		SlowLatencyDuration:     c.SlowLatencyDuration,
-		Timeout:                 c.Timeout,
-		TimeoutDuration:         c.TimeoutDuration,
-		Retry:                   cloneIntPtr(c.Retry),
-		RetryCount:              c.RetryCount,
-		RetryBaseDelay:          c.RetryBaseDelay,
-		RetryBaseDelayDuration:  c.RetryBaseDelayDuration,
-		RetryMaxDelay:           c.RetryMaxDelay,
-		RetryMaxDelayDuration:   c.RetryMaxDelayDuration,
-		RetryJitter:             cloneFloat64Ptr(c.RetryJitter),
-		RetryJitterValue:        c.RetryJitterValue,
-		DegradedWeight:          c.DegradedWeight,
-		MaxConcurrency:          c.MaxConcurrency,
-		StaggerProbes:           staggerPtr,
-		EnableConcurrentQuery:   c.EnableConcurrentQuery,
-		ConcurrentQueryLimit:    c.ConcurrentQueryLimit,
-		EnableBatchQuery:        c.EnableBatchQuery,
-		EnableDBTimelineAgg:     c.EnableDBTimelineAgg,
-		BatchQueryMaxKeys:       c.BatchQueryMaxKeys,
-		CacheTTL:                c.CacheTTL, // CacheTTL 是值类型，直接复制
-		Storage:                 c.Storage,
+		Interval:               c.Interval,
+		IntervalDuration:       c.IntervalDuration,
+		SlowLatency:            c.SlowLatency,
+		SlowLatencyDuration:    c.SlowLatencyDuration,
+		Timeout:                c.Timeout,
+		TimeoutDuration:        c.TimeoutDuration,
+		Retry:                  cloneIntPtr(c.Retry),
+		RetryCount:             c.RetryCount,
+		RetryBaseDelay:         c.RetryBaseDelay,
+		RetryBaseDelayDuration: c.RetryBaseDelayDuration,
+		RetryMaxDelay:          c.RetryMaxDelay,
+		RetryMaxDelayDuration:  c.RetryMaxDelayDuration,
+		RetryJitter:            cloneFloat64Ptr(c.RetryJitter),
+		RetryJitterValue:       c.RetryJitterValue,
+		DegradedWeight:         c.DegradedWeight,
+		MaxConcurrency:         c.MaxConcurrency,
+		StaggerProbes:          staggerPtr,
+		EnableConcurrentQuery:  c.EnableConcurrentQuery,
+		ConcurrentQueryLimit:   c.ConcurrentQueryLimit,
+		EnableBatchQuery:       c.EnableBatchQuery,
+		EnableDBTimelineAgg:    c.EnableDBTimelineAgg,
+		BatchQueryMaxKeys:      c.BatchQueryMaxKeys,
+		CacheTTL:               c.CacheTTL, // CacheTTL 是值类型，直接复制
+		Storage:                c.Storage,
+		Server: ServerConfig{
+			TrustedPlatform: c.Server.TrustedPlatform,
+			// 切片必须深拷贝：热更新期间新旧配置并存，共享 backing array 会让一份的改动串到另一份
+			TrustedProxies: append([]string(nil), c.Server.TrustedProxies...),
+		},
 		PublicBaseURL:           c.PublicBaseURL,
 		DisabledProviders:       make([]disabledProviderConfig, len(c.DisabledProviders)),
 		HiddenProviders:         make([]hiddenProviderConfig, len(c.HiddenProviders)),
+		AllowPrivateNetworks:    c.AllowPrivateNetworks,
+		HidePriceColumn:         c.HidePriceColumn,
+		HideDrawingColumn:       c.HideDrawingColumn,
+		HideCategoryFilter:      c.HideCategoryFilter,
+		HideVendorFilter:        c.HideVendorFilter,
 		Boards:                  c.Boards, // Boards 是值类型（含 AutoMove），直接复制
 		ExposeChannelDetails:    exposeChannelDetailsPtr,
 		ChannelDetailsProviders: make([]channelDetailsProviderConfig, len(c.ChannelDetailsProviders)),

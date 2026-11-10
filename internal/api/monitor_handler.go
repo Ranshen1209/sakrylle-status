@@ -2,6 +2,8 @@ package api
 
 import (
 	"context"
+	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"os"
@@ -10,21 +12,47 @@ import (
 	"strconv"
 	"strings"
 	"time"
+	"unicode"
 
 	"github.com/gin-gonic/gin"
 
 	"monitor/internal/config"
-	"monitor/internal/inlineprobe"
 	"monitor/internal/logger"
+	"monitor/internal/probe"
 	"monitor/internal/storage"
 )
 
 // adminProbeRequest 探测覆盖参数：非空字段会覆盖磁盘上保存的值，
 // 用于"编辑未保存就先测一下"的场景。空字段回退到 store 里的当前值。
+//
+// TargetModel 指定要探测的具体通道（父或子）：
+//   - 空：探测父通道（向后兼容；Template/BaseURL/APIKey 草稿覆盖仅在此分支生效）
+//   - 非空：按 (Provider,Service,Channel,Model) 在 runtime 已解析配置中定位目标
+//     通道并直接探测，不套用任何草稿覆盖（见 AdminProbeMonitor 中的不变量说明）
 type adminProbeRequest struct {
-	Template string `json:"template,omitempty"`
-	BaseURL  string `json:"base_url,omitempty"`
-	APIKey   string `json:"api_key,omitempty"`
+	Template    string `json:"template,omitempty"`
+	BaseURL     string `json:"base_url,omitempty"`
+	APIKey      string `json:"api_key,omitempty"`
+	TargetModel string `json:"target_model,omitempty"`
+}
+
+// adminProbeTarget 是 AdminGetMonitor 附带返回的"可探测目标"项，供前端为父/子
+// 通道分别渲染测试按钮。Model 取自 runtime 已解析配置（与 scheduler 同源、且
+// (P,S,C,Model) 经 validate 强制唯一），是探测请求 target_model 的稳定标识。
+//
+// ModelID 与 Model 分工不同，别混用：探测按 Model 选目标（scheduler 同源），
+// 停用/启用按 ModelID 选目标（monitors.d 行身份）。模板驱动的子行磁盘上 Model 是
+// 空串、同一父下多行完全同键，只有 ModelID 能唯一定位到「要改哪一行」。
+//
+// Disabled 是**有效值**而非磁盘值：runtime 命中时它已经过父子继承（父停用则子恒为
+// true），仅在 runtime 尚无该 PSC、回退 raw 文件时才等于磁盘值。故前端渲染「停用/
+// 启用」文案必须回读 monitors.d 原始行，不能用这个字段。
+type adminProbeTarget struct {
+	Role     string `json:"role"` // "parent" | "child"
+	Model    string `json:"model"`
+	ModelID  string `json:"model_id,omitempty"`
+	Template string `json:"template"`
+	Disabled bool   `json:"disabled"`
 }
 
 // AdminListTemplates 列出 templates/ 中的可用模板
@@ -105,7 +133,11 @@ func (h *Handler) AdminListMonitors(c *gin.Context) {
 	// 过滤
 	board := strings.TrimSpace(c.Query("board"))
 	status := strings.TrimSpace(c.Query("status"))
-	query := strings.ToLower(strings.TrimSpace(c.Query("q")))
+	queryTokens := monitorQueryTokens(c.Query("q"))
+	var resolvedModels map[string][]string
+	if len(queryTokens) > 0 {
+		resolvedModels = h.resolvedModelNamesByPSC()
+	}
 
 	var filtered []config.MonitorSummary
 	for _, s := range summaries {
@@ -127,11 +159,12 @@ func (h *Handler) AdminListMonitors(c *gin.Context) {
 		if status == "active" && (s.Disabled || s.Hidden) {
 			continue
 		}
-		if query != "" {
-			haystack := strings.ToLower(s.Provider + " " + s.Service + " " + s.Channel + " " + s.Template)
-			if !strings.Contains(haystack, query) {
-				continue
-			}
+		fields := s.SearchFields
+		if extra := resolvedModels[monitorPSCKey(s.Provider, s.Service, s.Channel)]; len(extra) > 0 {
+			fields = append(append([]string(nil), fields...), extra...)
+		}
+		if !monitorMatchesQuery(fields, queryTokens) {
+			continue
 		}
 		filtered = append(filtered, s)
 	}
@@ -147,16 +180,129 @@ func (h *Handler) AdminListMonitors(c *gin.Context) {
 	})
 }
 
+// monitorPSCKey 拼出 provider/service/channel 的查找键。
+func monitorPSCKey(provider, service, channel string) string {
+	return provider + "\x00" + service + "\x00" + channel
+}
+
+// resolvedModelNamesByPSC 从运行时配置（已套用模板）收集每个通道各层的模型名。
+// 模板驱动的行在 monitors.d 里 model 留空、名字写在模板里，只读文件会搜不到。
+// 运行时配置不可用时返回 nil，搜索退化为只匹配文件里的字段。
+func (h *Handler) resolvedModelNamesByPSC() map[string][]string {
+	appCfg := h.snapshotAppConfig()
+	if appCfg == nil {
+		return nil
+	}
+	models := make(map[string][]string)
+	for _, m := range appCfg.Monitors {
+		key := monitorPSCKey(m.Provider, m.Service, m.Channel)
+		models[key] = append(models[key], m.Model, m.RequestModel)
+	}
+	return models
+}
+
+// isMonitorSearchSeparator 列出通道名/模型名/域名里常见的分隔符。各家写法不一
+// （O-Max / o_max / gpt-5.6 / O-Team/Plus），搜索时把它们视为同一种。
+func isMonitorSearchSeparator(r rune) bool {
+	switch r {
+	case '-', '_', '/', '.', ':':
+		return true
+	}
+	return unicode.IsSpace(r)
+}
+
+// canonicalMonitorSearchText 小写化，并把每段连续分隔符折叠成一个 '-'。
+func canonicalMonitorSearchText(s string) string {
+	var b strings.Builder
+	inSep := false
+	for _, r := range s {
+		if isMonitorSearchSeparator(r) {
+			if !inSep {
+				b.WriteByte('-')
+			}
+			inSep = true
+			continue
+		}
+		inSep = false
+		b.WriteRune(unicode.ToLower(r))
+	}
+	return b.String()
+}
+
+// compactMonitorSearchText 小写化并去掉全部分隔符。
+func compactMonitorSearchText(s string) string {
+	return strings.Map(func(r rune) rune {
+		if isMonitorSearchSeparator(r) {
+			return -1
+		}
+		return unicode.ToLower(r)
+	}, s)
+}
+
+// monitorSearchToken 是搜索框里的一个词。输入里带分隔符的词按分隔符位置比对
+// （"0-0" 不该命中 "100x"）；不带的词忽略字段里的分隔符（"omax" 命中 "O-Max"）。
+type monitorSearchToken struct {
+	text   string
+	hasSep bool
+}
+
+// monitorQueryTokens 把搜索框输入按空白拆词；全是分隔符的词丢弃。
+func monitorQueryTokens(q string) []monitorSearchToken {
+	var tokens []monitorSearchToken
+	for _, word := range strings.Fields(q) {
+		if compactMonitorSearchText(word) == "" {
+			continue
+		}
+		canonical := canonicalMonitorSearchText(word)
+		if strings.Contains(canonical, "-") {
+			tokens = append(tokens, monitorSearchToken{text: canonical, hasSep: true})
+		} else {
+			tokens = append(tokens, monitorSearchToken{text: canonical})
+		}
+	}
+	return tokens
+}
+
+// monitorMatchesQuery 要求每个词都在某个字段里出现（词序不限）。按字段逐个比对而不是
+// 拼成一整串，避免一个词跨两个字段的边界凑出假命中。
+func monitorMatchesQuery(fields []string, tokens []monitorSearchToken) bool {
+	if len(tokens) == 0 {
+		return true
+	}
+	canonical := make([]string, len(fields))
+	compact := make([]string, len(fields))
+	for i, f := range fields {
+		canonical[i] = canonicalMonitorSearchText(f)
+		compact[i] = compactMonitorSearchText(f)
+	}
+	for _, tok := range tokens {
+		haystacks := compact
+		if tok.hasSep {
+			haystacks = canonical
+		}
+		found := false
+		for _, h := range haystacks {
+			if strings.Contains(h, tok.text) {
+				found = true
+				break
+			}
+		}
+		if !found {
+			return false
+		}
+	}
+	return true
+}
+
 // injectLatestProbe 给一批 summary 填充 LatestProbe 字段。
 //
 // 实现：
-//  1. 从 h.config.Monitors（已 resolveTemplates + parent_inheritance，model 字段是模板填充后的真实值）
-//     收集每个父 PSC 对应的所有 (PSCM, summaryIndex) 关联
-//  2. 用 storage.GetLatestBatch 一次批量查询所有 PSCM
+//  1. 从 h.config.Monitors（已 resolveTemplates + parent_inheritance，model_id 字段已回填）
+//     收集每个父 PSC 对应的所有 (model_id key, summaryIndex) 关联
+//  2. 用 storage.GetLatestBatchByModelID 一次按 model_id 批量查询
 //  3. 对每个 summary，选 timestamp 最大的记录填充 LatestProbe
 //
-// 与 AdminGetMonitorLogs 共用同一 PSCM 来源策略（运行时已解析配置），
-// 确保列表展示与日志面板字段级一致。
+// 按 model_id 稳定键查询，改展示名不断历史；列表活化与状态展示读路径口径一致。
 func (h *Handler) injectLatestProbe(summaries []config.MonitorSummary) {
 	if len(summaries) == 0 || h.storage == nil {
 		return
@@ -174,20 +320,15 @@ func (h *Handler) injectLatestProbe(summaries []config.MonitorSummary) {
 		pscToSummaryIdx[pscKey{s.Provider, s.Service, s.Channel}] = i
 	}
 
-	// 收集所有 PSCM；同时记录每个 PSCM 归属哪个 summary
-	keys := make([]storage.MonitorKey, 0, len(summaries))
-	keyToSummaryIdx := make(map[storage.MonitorKey]int, len(summaries))
+	// 收集所有 model_id 查询键；同时记录每个 key 归属哪个 summary
+	keys := make([]storage.ProbeHistoryKey, 0, len(summaries))
+	keyToSummaryIdx := make(map[storage.ProbeHistoryKey]int, len(summaries))
 	for _, m := range appCfg.Monitors {
 		idx, ok := pscToSummaryIdx[pscKey{m.Provider, m.Service, m.Channel}]
 		if !ok {
 			continue
 		}
-		k := storage.MonitorKey{
-			Provider: m.Provider,
-			Service:  m.Service,
-			Channel:  m.Channel,
-			Model:    m.Model,
-		}
+		k := probeHistoryKey(m)
 		keys = append(keys, k)
 		keyToSummaryIdx[k] = idx
 	}
@@ -195,7 +336,7 @@ func (h *Handler) injectLatestProbe(summaries []config.MonitorSummary) {
 		return
 	}
 
-	records, err := h.storage.GetLatestBatch(keys)
+	records, err := h.storage.GetLatestBatchByModelID(keys)
 	if err != nil {
 		logger.Warn("admin", "批量查询最新探测记录失败，列表退化为不带 latest_probe",
 			"key_count", len(keys), "error", err)
@@ -252,7 +393,8 @@ func (h *Handler) AdminGetMonitor(c *gin.Context) {
 	}
 
 	c.JSON(http.StatusOK, gin.H{
-		"monitor": file,
+		"monitor":       file,
+		"probe_targets": h.buildProbeTargets(findRawRoot(file.Monitors), file.Monitors),
 	})
 }
 
@@ -300,9 +442,17 @@ func (h *Handler) AdminCreateMonitor(c *gin.Context) {
 	}
 
 	if err := store.Create(&file); err != nil {
+		if isDisplayNameConflictError(err) {
+			apiError(c, http.StatusConflict, ErrCodeInvalidParam, err.Error())
+			return
+		}
 		errMsg := err.Error()
 		if strings.Contains(errMsg, "已存在") {
 			apiError(c, http.StatusConflict, ErrCodeInvalidParam, errMsg)
+			return
+		}
+		if isDuplicateModelIDError(err) {
+			apiError(c, http.StatusBadRequest, ErrCodeInvalidParam, errMsg)
 			return
 		}
 		if strings.Contains(errMsg, "无效") || strings.Contains(errMsg, "不能") {
@@ -317,6 +467,24 @@ func (h *Handler) AdminCreateMonitor(c *gin.Context) {
 	c.JSON(http.StatusCreated, gin.H{
 		"monitor": file,
 	})
+}
+
+// isDuplicateModelIDError 判定 store 写路径是否因 payload 内 model_id 重复被拒。
+// 这是客户端可修正的请求问题（4xx），与 5xx 的服务端故障区分开；用 errors.As 而非
+// 错误文本子串，避免文案调整时静默退化成 500。
+// 注意 toggle 路径刻意不映射：那里的 payload **只写** disabled/hidden（`model_id` 是
+// 纯选择器、不落进 MonitorFile），重复 id 必然来自磁盘上的历史坏文件，属服务端状态
+// 问题，保持 5xx + 日志更诚实。
+// isDisplayNameConflictError 判断写入是否因展示名与其它通道重复而被拒。
+// 必须先于按错误文本子串判错的分支：展示名来自配置，可能恰好含"无效""不存在"等字样。
+func isDisplayNameConflictError(err error) bool {
+	var conflict *config.DisplayNameConflictError
+	return errors.As(err, &conflict)
+}
+
+func isDuplicateModelIDError(err error) bool {
+	var dup *config.DuplicateModelIDError
+	return errors.As(err, &dup)
 }
 
 // AdminUpdateMonitor 更新监测项
@@ -349,6 +517,10 @@ func (h *Handler) AdminUpdateMonitor(c *gin.Context) {
 	}
 
 	if err := store.Update(key, &req.Monitor, req.Revision); err != nil {
+		if isDisplayNameConflictError(err) {
+			apiError(c, http.StatusConflict, ErrCodeInvalidParam, err.Error())
+			return
+		}
 		errMsg := err.Error()
 		if strings.Contains(errMsg, "不存在") {
 			apiError(c, http.StatusNotFound, ErrCodeNotFound, errMsg)
@@ -358,7 +530,7 @@ func (h *Handler) AdminUpdateMonitor(c *gin.Context) {
 			apiError(c, http.StatusConflict, ErrCodeInvalidParam, errMsg)
 			return
 		}
-		if strings.Contains(errMsg, "不可变更") || strings.Contains(errMsg, "无效") {
+		if strings.Contains(errMsg, "不可变更") || strings.Contains(errMsg, "无效") || isDuplicateModelIDError(err) {
 			apiError(c, http.StatusBadRequest, ErrCodeInvalidParam, errMsg)
 			return
 		}
@@ -399,8 +571,40 @@ func (h *Handler) AdminDeleteMonitor(c *gin.Context) {
 	c.JSON(http.StatusOK, gin.H{"status": "archived"})
 }
 
+// optionalString 区分 JSON 字段的三种状态：缺省 / 显式 null / 有值。
+//
+// 标准 `*string` 只能分出两种——缺省与 null 都是 nil。对「缺省」和「空值」语义相反的
+// 字段（如 toggle 的 model_id：缺省=改父行、空值=拒绝）这个折叠是危险的。
+// encoding/json 对实现了 Unmarshaler 的**非指针**字段，在值为 null 时同样会调用
+// UnmarshalJSON，字段整个缺省时才不调用——Present 据此成立。
+type optionalString struct {
+	Present bool
+	Value   string
+}
+
+func (o *optionalString) UnmarshalJSON(b []byte) error {
+	o.Present = true
+	if string(b) == "null" {
+		o.Value = "" // 显式 null 按「给了空值」处理，由调用方决定拒绝还是容忍
+		return nil
+	}
+	return json.Unmarshal(b, &o.Value)
+}
+
 // AdminToggleMonitor 切换监测项的 disabled/hidden 状态
 // POST /api/admin/monitors/:key/toggle
+//
+// 目标行由可选的 `model_id` 选择：
+//   - 字段缺省 → 改该文件的父行（历史语义，旧客户端不受影响）
+//   - 字段存在但为空/空白 → 400。这是「前端渲染了一个没有目标的按钮」的形状，
+//     绝不能按缺省语义悄悄落到父行上——用户以为停一个模型，实际停掉整条通道。
+//   - 字段非空 → 精确命中该 model_id 的那一行；找不到 404，**永不回落父行**。
+//
+// 为什么选择器只能是 model_id：模板驱动的子行磁盘上 `model` 是空串，同一父下多个
+// 子行的展示名完全相同（见 config.childMatchKeyByModel），按名字选会停错行。
+//
+// `model_id` 只读不写——它不会进入落盘的 MonitorFile，故 store 写盘报 model_id
+// 重复时仍是服务端状态问题，维持 5xx（见 isDuplicateModelIDError 注释）。
 func (h *Handler) AdminToggleMonitor(c *gin.Context) {
 	if !h.checkAdminToken(c) {
 		return
@@ -417,6 +621,9 @@ func (h *Handler) AdminToggleMonitor(c *gin.Context) {
 	var req struct {
 		Field string `json:"field" binding:"required"` // "disabled" or "hidden"
 		Value bool   `json:"value"`
+		// 自定义类型而非 *string：两者都能表达「缺省」，但 *string 会把显式 `null`
+		// 也解成 nil，于是 {"model_id":null} 悄悄按父行执行——正是本字段要堵的事故。
+		ModelID optionalString `json:"model_id"`
 	}
 	if err := c.ShouldBindJSON(&req); err != nil {
 		apiError(c, http.StatusBadRequest, ErrCodeInvalidParam, "请求参数无效")
@@ -425,6 +632,14 @@ func (h *Handler) AdminToggleMonitor(c *gin.Context) {
 	if req.Field != "disabled" && req.Field != "hidden" {
 		apiError(c, http.StatusBadRequest, ErrCodeInvalidParam, "field 只能是 disabled 或 hidden")
 		return
+	}
+	targetModelID := ""
+	if req.ModelID.Present {
+		targetModelID = strings.TrimSpace(req.ModelID.Value)
+		if targetModelID == "" {
+			apiError(c, http.StatusBadRequest, ErrCodeInvalidParam, "model_id 不能为空；要切换父通道请整个省略该字段")
+			return
+		}
 	}
 
 	file, err := store.Get(key)
@@ -438,19 +653,46 @@ func (h *Handler) AdminToggleMonitor(c *gin.Context) {
 		return
 	}
 
-	for i := range file.Monitors {
-		if strings.TrimSpace(file.Monitors[i].Parent) != "" {
-			continue // 只修改父通道
-		}
+	applyToggle := func(m *config.ServiceConfig) {
 		switch req.Field {
 		case "disabled":
-			file.Monitors[i].Disabled = req.Value
+			m.Disabled = req.Value
 		case "hidden":
-			file.Monitors[i].Hidden = req.Value
+			m.Hidden = req.Value
+		}
+	}
+
+	if targetModelID == "" {
+		for i := range file.Monitors {
+			if strings.TrimSpace(file.Monitors[i].Parent) != "" {
+				continue // 未指定 model_id：只修改父通道
+			}
+			applyToggle(&file.Monitors[i])
+		}
+	} else {
+		matched := false
+		for i := range file.Monitors {
+			// 只 trim 入参、不 trim 盘上的值：ValidateFileModelIDsUnique 按原串判重，
+			// 两边口径不一致会让 " md_x " 与 "md_x" 在这里撞成同一行、却逃过唯一性校验。
+			if file.Monitors[i].ModelID != targetModelID {
+				continue
+			}
+			applyToggle(&file.Monitors[i])
+			matched = true
+			break // model_id 在文件内唯一（ValidateFileModelIDsUnique 写盘前把关）
+		}
+		if !matched {
+			apiError(c, http.StatusNotFound, ErrCodeNotFound,
+				"该通道下不存在 model_id 为 "+targetModelID+" 的监测行")
+			return
 		}
 	}
 
 	if err := store.Update(key, file, file.Metadata.Revision); err != nil {
+		if isDisplayNameConflictError(err) {
+			apiError(c, http.StatusConflict, ErrCodeInvalidParam, err.Error())
+			return
+		}
 		errMsg := err.Error()
 		if strings.Contains(errMsg, "revision") {
 			apiError(c, http.StatusConflict, ErrCodeInvalidParam, errMsg)
@@ -493,6 +735,10 @@ func (h *Handler) AdminProbeMonitor(c *gin.Context) {
 		return
 	}
 
+	// 探测响应（成功体含 curl / response_snippet 等敏感内容）禁止任何中间层缓存。
+	// 入口处统一设置，覆盖所有 early-return 错误分支。
+	c.Header("Cache-Control", "no-store")
+
 	key := c.Param("key")
 	file, err := store.Get(key)
 	if err != nil {
@@ -505,14 +751,8 @@ func (h *Handler) AdminProbeMonitor(c *gin.Context) {
 		return
 	}
 
-	// 找到父通道
-	var root *config.ServiceConfig
-	for i := range file.Monitors {
-		if strings.TrimSpace(file.Monitors[i].Parent) == "" {
-			root = &file.Monitors[i]
-			break
-		}
-	}
+	// 找到父通道（用于定位本文件的 PSC，子通道探测也以此为锚）
+	root := findRawRoot(file.Monitors)
 	if root == nil {
 		apiError(c, http.StatusBadRequest, ErrCodeInvalidParam, "找不到父通道")
 		return
@@ -526,47 +766,70 @@ func (h *Handler) AdminProbeMonitor(c *gin.Context) {
 			return
 		}
 	}
+	targetModel := strings.TrimSpace(req.TargetModel)
 
-	// 拒绝 template 覆盖：模板字段变更涉及 URLPattern/Headers/Body/SuccessContains 等
-	// 派生字段的重新解析，沙箱测试无法做到"半解析"。前端应在用户编辑模板时禁用 Probe 按钮。
-	if overrideTpl := strings.TrimSpace(req.Template); overrideTpl != "" && overrideTpl != strings.TrimSpace(root.Template) {
-		apiError(c, http.StatusUnprocessableEntity, ErrCodeTemplateChangeRequiresSave,
-			"修改模板需保存后再测试（base_url / api_key 可即时覆盖）")
-		return
-	}
+	var cfg config.ServiceConfig
 
-	// 取已解析的 runtime config（与 scheduler 一致）；未命中则 fallback 到 raw + 即时解析。
-	cfg, isResolved := h.resolveRuntimeRoot(root)
-
-	if !isResolved {
-		// fallback 路径：raw monitor file 未在运行时配置中（多见于刚 Create 还未热重载）。
-		// 即时走 ResolveSingleMonitor 把模板和 Duration 派生上去；并在响应头标注 fallback。
-		appCfg := h.snapshotAppConfig()
-		if appCfg == nil {
-			apiError(c, http.StatusServiceUnavailable, ErrCodeServiceUnavailable, "运行时配置未就绪")
+	if targetModel != "" {
+		// 子通道（或显式指定 model 的目标）：只测 runtime 已解析配置，且不套用任何
+		// 草稿覆盖。
+		//
+		// 不变量：runtime resolved cfg 已丢失"字段来自父还是子"的来源信息，无法判断
+		// base_url/api_key 是子通道自有还是从父通道继承；若贸然套父表单的 base_url/
+		// api_key 草稿，会探测到 scheduler 永远不会使用的配置，破坏"inline 与 scheduler
+		// 字段级一致"的硬约束。故此分支忽略 req.Template/BaseURL/APIKey。
+		matched, ok := h.resolveRuntimeByModel(root, targetModel)
+		if !ok {
+			apiError(c, http.StatusConflict, ErrCodeInvalidParam,
+				"目标通道配置尚未生效（可能刚创建/修改），请保存并等待热更新后重试")
 			return
 		}
-		if err := config.ResolveSingleMonitor(appCfg, &cfg, h.configDir()); err != nil {
-			logger.Error("admin", "ResolveSingleMonitor 失败", "key", key, "error", err)
-			apiError(c, http.StatusInternalServerError, ErrCodeInternalError, "解析监测配置失败: "+err.Error())
+		cfg = matched
+	} else {
+		// 拒绝 template 覆盖：模板字段变更涉及 URLPattern/Headers/Body/SuccessContains 等
+		// 派生字段的重新解析，沙箱测试无法做到"半解析"。前端应在用户编辑模板时禁用 Probe
+		// 按钮。此校验放在解析之前，保持与旧实现一致的 422 语义（避免 raw fallback 解析
+		// 失败时把 422 降级成 500 解析错误）。
+		if overrideTpl := strings.TrimSpace(req.Template); overrideTpl != "" && overrideTpl != strings.TrimSpace(root.Template) {
+			apiError(c, http.StatusUnprocessableEntity, ErrCodeTemplateChangeRequiresSave,
+				"修改模板需保存后再测试（base_url / api_key 可即时覆盖）")
 			return
 		}
-		logger.Warn("admin", "AdminProbeMonitor 使用 raw fallback 解析",
-			"key", key, "provider", root.Provider, "service", root.Service, "channel", root.Channel)
-		c.Header("X-Probe-Config-Source", "raw-fallback")
-	}
 
-	// 应用 base_url / api_key 覆盖（用于"编辑未保存"场景）
-	if v := strings.TrimSpace(req.BaseURL); v != "" {
-		// 覆盖参数源自管理员输入，必须过 SSRF 守卫（与 OnboardingTest 一致）
-		if err := inlineprobe.NewSSRFGuard().ValidateURL(v); err != nil {
-			apiError(c, http.StatusBadRequest, ErrCodeInvalidParam, "base_url 安全校验失败: "+err.Error())
-			return
+		// 父通道：取已解析的 runtime config（与 scheduler 一致）；未命中则 fallback 到
+		// raw + 即时解析（多见于刚 Create 还未热重载）。仅父通道走 ResolveSingleMonitor，
+		// 子通道需要父继承、不能用它做"半解析"，因此子通道未生效时直接报错（见上）。
+		resolved, isResolved := h.resolveRuntimeRoot(root)
+		cfg = resolved
+
+		if !isResolved {
+			appCfg := h.snapshotAppConfig()
+			if appCfg == nil {
+				apiError(c, http.StatusServiceUnavailable, ErrCodeServiceUnavailable, "运行时配置未就绪")
+				return
+			}
+			if err := config.ResolveSingleMonitor(appCfg, &cfg, h.configDir()); err != nil {
+				logger.Error("admin", "ResolveSingleMonitor 失败", "key", key, "error", err)
+				apiError(c, http.StatusInternalServerError, ErrCodeInternalError, "解析监测配置失败: "+err.Error())
+				return
+			}
+			logger.Warn("admin", "AdminProbeMonitor 使用 raw fallback 解析",
+				"key", key, "provider", root.Provider, "service", root.Service, "channel", root.Channel)
+			c.Header("X-Probe-Config-Source", "raw-fallback")
 		}
-		cfg.BaseURL = strings.TrimRight(v, "/")
-	}
-	if v := strings.TrimSpace(req.APIKey); v != "" {
-		cfg.APIKey = v
+
+		// 应用 base_url / api_key 覆盖（仅父通道，用于"编辑未保存"场景）
+		if v := strings.TrimSpace(req.BaseURL); v != "" {
+			// 覆盖参数源自管理员输入，必须过 SSRF 守卫（与 OnboardingTest 一致）
+			if err := probe.NewSSRFGuard().ValidateURL(v); err != nil {
+				apiError(c, http.StatusBadRequest, ErrCodeInvalidParam, "base_url 安全校验失败: "+err.Error())
+				return
+			}
+			cfg.BaseURL = strings.TrimRight(v, "/")
+		}
+		if v := strings.TrimSpace(req.APIKey); v != "" {
+			cfg.APIKey = v
+		}
 	}
 
 	if strings.TrimSpace(cfg.BaseURL) == "" {
@@ -578,7 +841,10 @@ func (h *Handler) AdminProbeMonitor(c *gin.Context) {
 	ctx, cancel := context.WithTimeout(c.Request.Context(), 30*time.Second)
 	defer cancel()
 
-	result := h.inlineProber.ProbeConfig(ctx, cfg)
+	// 仅管理员通道管理探测显式传 cfg.Proxy：配了代理就走代理（与 scheduler 真实链路一致）、
+	// 没配则 no-op 直连。公开 onboarding/change 自测调用方不传 WithProxy，因而绝不会因用户
+	// 输入或进程环境变量走代理（SSRF 硬边界）。cfg.Proxy 对子通道已是继承后的值。
+	result := h.inlineProber.ProbeConfig(ctx, cfg, probe.WithCurlCapture(), probe.WithProxy(cfg.Proxy))
 
 	c.JSON(http.StatusOK, gin.H{
 		"probe_id":         result.ProbeID,
@@ -588,6 +854,8 @@ func (h *Handler) AdminProbeMonitor(c *gin.Context) {
 		"latency":          result.Latency,
 		"error_message":    result.ErrorMessage,
 		"response_snippet": result.ResponseSnippet,
+		"curl":             result.Curl,
+		"via_proxy":        result.ViaProxy,
 	})
 }
 
@@ -604,20 +872,117 @@ func (h *Handler) resolveRuntimeRoot(root *config.ServiceConfig) (config.Service
 	if root == nil {
 		return config.ServiceConfig{}, false
 	}
-	h.cfgMu.RLock()
-	defer h.cfgMu.RUnlock()
-	if h.config == nil {
+	found, ok := findRuntimeRootByPSC(h.snapshotAppConfig(), root.Provider, root.Service, root.Channel)
+	if !ok {
 		return *root, false
 	}
-	for _, m := range h.config.Monitors {
+	return found, true
+}
+
+// findRuntimeRootByPSC 在运行时配置里按 PSC 三元组查找**父通道行**（Parent 为空）。
+//
+// 「只认父行」不是筛选偏好而是语义：子行的 ServiceConfig 依赖父继承，脱离父行单独拿到的
+// 那份是半解析状态；而变更流程的认证候选本身也只由父行构建（internal/change/index.go 里
+// `m.Parent != ""` 直接跳过），故「一个 PSC 对应哪一行」在两处必须是同一个答案。
+//
+// 抽成独立函数是为了让 resolveRuntimeRoot 与变更流程共用同一份匹配规则——两处各写一遍
+// 循环，日后有人给其中一处加了条件（比如跳过 disabled）就会静默产生两种「根行」定义。
+//
+// 返回值拷贝，浅拷贝语义与 resolveRuntimeRoot 一致：只适合覆盖 BaseURL/APIKey 这类字符串
+// 字段，要改 Headers 等引用字段的调用方必须自行深拷贝。
+func findRuntimeRootByPSC(appCfg *config.AppConfig, provider, service, channel string) (config.ServiceConfig, bool) {
+	if appCfg == nil {
+		return config.ServiceConfig{}, false
+	}
+	for _, m := range appCfg.Monitors {
 		if strings.TrimSpace(m.Parent) != "" {
 			continue
 		}
-		if m.Provider == root.Provider && m.Service == root.Service && m.Channel == root.Channel {
+		if m.Provider == provider && m.Service == service && m.Channel == channel {
 			return m, true
 		}
 	}
-	return *root, false
+	return config.ServiceConfig{}, false
+}
+
+// findRawRoot 返回 monitor file 中的父通道（Parent 为空的第一条）。
+// 返回指向 slice 元素的指针，调用方仅用于同步只读（读取 PSC / template 等）。
+func findRawRoot(monitors []config.ServiceConfig) *config.ServiceConfig {
+	for i := range monitors {
+		if strings.TrimSpace(monitors[i].Parent) == "" {
+			return &monitors[i]
+		}
+	}
+	return nil
+}
+
+// resolveRuntimeByModel 按 raw root 的 PSC + 目标 model 在运行时配置中定位已解析通道。
+//
+// 与 resolveRuntimeRoot 不同，本方法**不限定 Parent**：父通道与各子通道在同一 PSC 下
+// 由 (Provider,Service,Channel,Model) 四元组唯一区分（validate 强制），因此按 model 精确
+// 命中即可，无需关心命中的是父还是子。返回值为值拷贝，避免后续探测覆盖污染全局 runtime。
+func (h *Handler) resolveRuntimeByModel(root *config.ServiceConfig, model string) (config.ServiceConfig, bool) {
+	if root == nil || strings.TrimSpace(model) == "" {
+		return config.ServiceConfig{}, false
+	}
+	h.cfgMu.RLock()
+	defer h.cfgMu.RUnlock()
+	if h.config == nil {
+		return config.ServiceConfig{}, false
+	}
+	for _, m := range h.config.Monitors {
+		if m.Provider == root.Provider &&
+			m.Service == root.Service &&
+			m.Channel == root.Channel &&
+			m.Model == model {
+			return m, true
+		}
+	}
+	return config.ServiceConfig{}, false
+}
+
+// buildProbeTargets 列出某通道文件下所有可探测目标（父 + 各子通道），供前端逐个渲染
+// 测试按钮。
+//
+// 优先取 runtime 已解析配置：其 Model 与 scheduler 同源，且作为探测请求的 target_model
+// 标识稳定可靠。runtime 尚无该 PSC（多见于刚 Create 还未热重载）时回退到 raw 文件，
+// 此时子通道 Model 可能为空——前端据此禁用该行测试按钮并提示"尚未生效"。
+func (h *Handler) buildProbeTargets(root *config.ServiceConfig, rawMonitors []config.ServiceConfig) []adminProbeTarget {
+	if root == nil {
+		return nil
+	}
+
+	h.cfgMu.RLock()
+	var runtime []config.ServiceConfig
+	if h.config != nil {
+		for _, m := range h.config.Monitors {
+			if m.Provider == root.Provider && m.Service == root.Service && m.Channel == root.Channel {
+				runtime = append(runtime, m)
+			}
+		}
+	}
+	h.cfgMu.RUnlock()
+
+	source := runtime
+	if len(source) == 0 {
+		source = rawMonitors // 未热重载：退回 raw 结构（Model 可能为空）
+	}
+
+	targets := make([]adminProbeTarget, 0, len(source))
+	for _, m := range source {
+		role := "parent"
+		if strings.TrimSpace(m.Parent) != "" {
+			role = "child"
+		}
+		targets = append(targets, adminProbeTarget{
+			Role:     role,
+			Model:    m.Model,
+			ModelID:  m.ModelID,
+			Template: m.Template,
+			Disabled: m.Disabled,
+		})
+	}
+	return targets
 }
 
 // snapshotAppConfig 原子地读取当前运行时 AppConfig 指针，避免持锁太久。
@@ -794,6 +1159,7 @@ func (h *Handler) AdminGetMonitorLogs(c *gin.Context) {
 	db := h.storage.WithContext(queryCtx)
 	logs := make([]adminMonitorLogItem, 0, limit)
 	for _, k := range keys {
+		// admin logs 故意保留 PSCM 查询：孤儿/legacy（改名前）历史仍可按旧展示名查到
 		records, err := db.GetHistoryWithLimit(k.provider, k.service, k.channel, k.model, since, limit)
 		if err != nil {
 			logger.Error("admin", "查询监测日志失败",

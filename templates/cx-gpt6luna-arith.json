@@ -1,0 +1,59 @@
+{
+	"self_serve_label": "GPT-6 Luna",
+	"_comment": "订阅态形态（2026-09-16 转正），headers 与 body 与 `cx-gpt-arith` **逐字节相同**、模型靠 {{MODEL}} 占位符适配。**形态依据、5 处有意改动、占位符选择理由、已知风险一律见 `cx-gpt-arith` 的 _comment，别在本文件复述**；改动必须族内全员同步。\n\n---\n\ngpt-6-luna（2026-09-23 接入）。本模型**要求客户端版本 ≥0.155.1**：UA/version 报 0.154.0 时上游回 400 `The 'gpt-6-luna' model is not supported when using Codex with a ChatGPT account.`，全族因此升到 0.155.1，实测与抓包比对见 `cx-gpt-arith` 的 _comment。",
+	"model": "GPT-6-Luna",
+	"request_model": "gpt-6-luna",
+	"model_vendor": "openai",
+	"url": "{{BASE_URL}}/v1/responses",
+	"method": "POST",
+	"headers": {
+		"accept": "text/event-stream",
+		"Authorization": "Bearer {{API_KEY}}",
+		"chatgpt-account-id": "{{STABLE_UUID2}}",
+		"content-type": "application/json",
+		"originator": "codex_exec",
+		"session-id": "{{SESSION_UUID_V7}}",
+		"thread-id": "{{SESSION_UUID_V7}}",
+		"user-agent": "codex_exec/0.159.2 (Ubuntu 22.4.0; x86_64) VTE/6800 (codex_exec; 0.159.2)",
+		"version": "0.159.2",
+		"x-client-request-id": "{{RAND_UUID_V7}}",
+		"x-codex-beta-features": "remote_compaction_v2",
+		"x-codex-routing-hint": "model={{MODEL}}",
+		"x-codex-turn-metadata": "{\"installation_id\":\"{{STABLE_UUID}}\",\"session_id\":\"{{SESSION_UUID_V7}}\",\"thread_id\":\"{{SESSION_UUID_V7}}\",\"agent_name\":\"/root\",\"turn_id\":\"{{RAND_UUID_V7_2}}\",\"window_id\":\"{{SESSION_UUID_V7}}:0\",\"window_number\":0,\"context_window_id\":\"{{SESSION_UUID_V7}}\",\"request_kind\":\"turn\",\"root_turn_id\":\"{{RAND_UUID_V7_2}}\",\"thread_source\":\"user\",\"turn_trigger\":\"exec\",\"sandbox\":\"seccomp\",\"sandbox_mode\":\"read-only\",\"auto_review_enabled\":false,\"node_repl_auto_review_required\":false,\"node_repl_disabled\":false,\"turn_started_at_unix_ms\":{{UNIX_MS}},\"analytics_enabled\":true,\"model\":\"{{MODEL}}\",\"reasoning_effort\":\"low\"}",
+		"x-codex-window-id": "{{SESSION_UUID_V7}}:0"
+	},
+	"body": {
+		"model": "{{MODEL}}",
+		"instructions": "You are Codex, based on GPT-5. You are running as a coding agent in the Codex CLI on a user's computer.",
+		"input": [
+			{
+				"type": "message",
+				"role": "user",
+				"content": [
+					{
+						"type": "input_text",
+						"text": "{{PROMPT}}"
+					}
+				]
+			}
+		],
+		"tools": [],
+		"tool_choice": "auto",
+		"parallel_tool_calls": false,
+		"reasoning": {
+			"effort": "low",
+			"summary": "auto"
+		},
+		"store": false,
+		"stream": true,
+		"prompt_cache_key": "{{SESSION_UUID_V7}}"
+	},
+	"response": {
+		"success_contains": "{{EXPECTED_ANSWER}}"
+	},
+	"probe": {
+		"slow_latency": "8s",
+		"timeout": "15s",
+		"retry": 0
+	}
+}

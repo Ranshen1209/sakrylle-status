@@ -16,9 +16,10 @@ import (
 	"monitor/internal/automove"
 	"monitor/internal/change"
 	"monitor/internal/config"
-	"monitor/internal/inlineprobe"
 	"monitor/internal/logger"
 	"monitor/internal/onboarding"
+	"monitor/internal/probe"
+	"monitor/internal/rpdiag"
 	"monitor/internal/storage"
 )
 
@@ -170,6 +171,10 @@ func (c *statusCache) setWithTTL(key string, data []byte, ttl time.Duration) {
 		ttl = c.ttl
 	}
 
+	if c.maxSize <= 0 {
+		return // 容量为 0 即不缓存
+	}
+
 	buf := make([]byte, len(data))
 	copy(buf, data)
 
@@ -177,18 +182,26 @@ func (c *statusCache) setWithTTL(key string, data []byte, ttl time.Duration) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
-	// 容量限制：超出时清理过期条目
-	if len(c.entries) >= c.maxSize {
+	// 容量限制：只在写入新 key 时检查（刷新已有 key 不增加条目），先清理过期条目
+	if _, exists := c.entries[key]; !exists && len(c.entries) >= c.maxSize {
 		for k, v := range c.entries {
 			if now.After(v.expireAt) {
 				delete(c.entries, k)
 			}
 		}
-	}
 
-	// 仍然超出则跳过写入（防止 DoS）
-	if len(c.entries) >= c.maxSize {
-		return
+		// 仍然超出则淘汰最早到期的一条再写入。不能跳过写入：请求方用随机查询参数填满缓存后，
+		// 合法 key 就再也进不来，每次都直达数据库。maxSize 很小，线性扫描足够。
+		if len(c.entries) >= c.maxSize {
+			var oldestKey string
+			var oldestExpire time.Time
+			for k, v := range c.entries {
+				if oldestKey == "" || v.expireAt.Before(oldestExpire) {
+					oldestKey, oldestExpire = k, v.expireAt
+				}
+			}
+			delete(c.entries, oldestKey)
+		}
 	}
 
 	c.entries[key] = &cacheEntry{
@@ -240,18 +253,20 @@ func (c *statusCache) loadWithTTL(key string, ttl time.Duration, loader func() (
 
 // Handler API处理器
 type Handler struct {
-	storage       storage.Storage
-	config        *config.AppConfig
-	cfgMu         sync.RWMutex              // 保护config的并发访问
-	cache         *statusCache              // API 响应缓存
-	autoMover     *automove.Service         // 自动移板服务（可选）
-	inlineProber  *inlineprobe.InlineProber // 内联探测器
-	probeLimiter  *inlineprobe.IPLimiter    // 公共探测端点限流
-	onboardingMu  sync.RWMutex              // 保护 onboardingSvc 热替换
-	onboardingSvc *onboarding.Service       // 自助收录服务（可选）
-	changeMu      sync.RWMutex              // 保护 changeSvc 热替换
-	changeSvc     *change.Service           // 变更请求服务（可选）
-	monitorStore  *config.MonitorStore      // monitors.d/ CRUD（可选）
+	storage          storage.Storage
+	config           *config.AppConfig
+	cfgMu            sync.RWMutex         // 保护config的并发访问
+	cache            *statusCache         // API 响应缓存
+	autoMover        *automove.Service    // 自动移板服务（可选）
+	inlineProber     *probe.InlineProber  // 内联探测器
+	probeLimiter     *probe.IPLimiter     // 公共探测端点限流
+	adminAuthLimiter *authFailureLimiter  // 管理后台鉴权失败限速（可选）
+	onboardingMu     sync.RWMutex         // 保护 onboardingSvc 热替换
+	onboardingSvc    *onboarding.Service  // 自助收录服务（可选）
+	changeMu         sync.RWMutex         // 保护 changeSvc 热替换
+	changeSvc        *change.Service      // 变更请求服务（可选）
+	monitorStore     *config.MonitorStore // monitors.d/ CRUD（可选）
+	rpdiagClient     *rpdiag.Client       // rpdiag 质量分客户端（可选，启动时一次性注入）
 }
 
 // NewHandler 创建处理器
@@ -265,13 +280,97 @@ func NewHandler(store storage.Storage, cfg *config.AppConfig, autoMover *automov
 }
 
 // SetInlineProber 设置内联探测器。
-func (h *Handler) SetInlineProber(p *inlineprobe.InlineProber) {
+func (h *Handler) SetInlineProber(p *probe.InlineProber) {
 	h.inlineProber = p
 }
 
+// SetRpdiagClient 注入 rpdiag 质量分客户端。client 为 nil 表示未启用。
+// 设计为启动期一次性注入（不支持热替换），故无锁。
+func (h *Handler) SetRpdiagClient(client *rpdiag.Client) {
+	h.rpdiagClient = client
+}
+
+// rpdiagEnabled 报告 rpdiag 质量分功能是否启用（= 是否注入了客户端）。
+// 这是「质量列（含前端 rpdiag_enabled flag）/ 旧 /detect 路径 301」共用的单一信号源：
+// 私有化部署未设 MONITOR_RPDIAG_ENABLED 时质量入口全部一致地消失。
+// rpdiagClient 仅启动期一次性注入、不支持热替换，故读取无需加锁。
+func (h *Handler) rpdiagEnabled() bool {
+	return h.rpdiagClient != nil
+}
+
+// GetRpdiagScores 返回 rpdiag 质量分索引（按 "provider|service|channel" 键）。
+// 当客户端未启用（MONITOR_RPDIAG_ENABLED=false / 未设置）时返回空对象，
+// 由前端兜底显示 "-"；上游异常时返回 503，前端走同样的空兜底。
+func (h *Handler) GetRpdiagScores(c *gin.Context) {
+	if !h.rpdiagEnabled() {
+		c.Header("Cache-Control", "no-store")
+		c.JSON(http.StatusOK, gin.H{})
+		return
+	}
+
+	ctx, cancel := context.WithTimeout(c.Request.Context(), 15*time.Second)
+	defer cancel()
+
+	scores, err := h.rpdiagClient.Scores(ctx)
+	if err != nil {
+		logger.FromContext(c.Request.Context(), "api").Error(
+			"获取 rpdiag 质量分失败", "error", err,
+		)
+		apiError(c, http.StatusServiceUnavailable, ErrCodeServiceUnavailable, "质量分暂不可用")
+		return
+	}
+
+	c.Header("Cache-Control", "public, max-age=60")
+	c.JSON(http.StatusOK, scores)
+}
+
+// GetRpdiagDrawings 返回画作列要的画：`?task_ids=` 重复给出（取自质量分里的
+// trend.recent_runs，≤ rpdiag.MaxDrawingIDs 个）。只认当前快照里出现过的 run，
+// 其余静默略过；rpdiag 取不到时返回已缓存的部分，不让一列图拖垮页面。
+func (h *Handler) GetRpdiagDrawings(c *gin.Context) {
+	if !h.rpdiagEnabled() {
+		c.Header("Cache-Control", "no-store")
+		c.JSON(http.StatusOK, gin.H{"items": []rpdiag.Drawing{}})
+		return
+	}
+	ids := c.QueryArray("task_ids")
+	if len(ids) == 0 || len(ids) > rpdiag.MaxDrawingIDs {
+		apiError(c, http.StatusBadRequest, ErrCodeInvalidParam,
+			fmt.Sprintf("task_ids 需 1–%d 个", rpdiag.MaxDrawingIDs))
+		return
+	}
+
+	ctx, cancel := context.WithTimeout(c.Request.Context(), 20*time.Second)
+	defer cancel()
+
+	items, complete, err := h.rpdiagClient.Drawings(ctx, ids)
+	if err != nil {
+		logger.FromContext(c.Request.Context(), "api").Error(
+			"获取 rpdiag 画作失败", "error", err,
+		)
+		apiError(c, http.StatusServiceUnavailable, ErrCodeServiceUnavailable, "画作暂不可用")
+		return
+	}
+	if items == nil {
+		items = []rpdiag.Drawing{}
+	}
+	if complete {
+		c.Header("Cache-Control", "public, max-age=300")
+	} else {
+		// rpdiag 取不到时的残缺结果别进共享缓存
+		c.Header("Cache-Control", "no-store")
+	}
+	c.JSON(http.StatusOK, gin.H{"items": items})
+}
+
 // SetProbeLimiter 设置公共探测端点限流器。
-func (h *Handler) SetProbeLimiter(l *inlineprobe.IPLimiter) {
+func (h *Handler) SetProbeLimiter(l *probe.IPLimiter) {
 	h.probeLimiter = l
+}
+
+// EnableAdminAuthLimit 开启管理后台鉴权失败限速：每 IP 每分钟回补 perMinute 次失败额度，最多累积 burst 次。
+func (h *Handler) EnableAdminAuthLimit(perMinute, burst int) {
+	h.adminAuthLimiter = newAuthFailureLimiter(perMinute, burst)
 }
 
 // SetOnboardingService 设置自助收录服务（并发安全，支持热更新时替换实例）
@@ -321,32 +420,36 @@ type CurrentStatus struct {
 
 // MonitorResult API返回结构
 type MonitorResult struct {
-	Provider      string              `json:"provider"`
-	ProviderName  string              `json:"provider_name,omitempty"` // Provider 显示名称
-	ProviderSlug  string              `json:"provider_slug"`           // URL slug（用于生成专属页面链接）
-	ProviderURL   string              `json:"provider_url"`            // 服务商官网链接
-	Service       string              `json:"service"`
-	ServiceName   string              `json:"service_name,omitempty"`  // Service 显示名称
-	Category      string              `json:"category"`                // 分类：commercial（商业站）或 public（公益站）
-	Sponsor       string              `json:"sponsor"`                 // 赞助者
-	SponsorURL    string              `json:"sponsor_url"`             // 赞助者链接
-	SponsorLevel  config.SponsorLevel `json:"sponsor_level,omitempty"` // 赞助等级（事实字段，不受 enable_annotations 影响）
-	Annotations   []config.Annotation `json:"annotations,omitempty"`   // 统一注解数组（受 enable_annotations 开关控制）
-	PriceMin      *float64            `json:"price_min,omitempty"`     // 参考倍率下限
-	PriceMax      *float64            `json:"price_max,omitempty"`     // 参考倍率
-	ListedDays    *int                `json:"listed_days,omitempty"`   // 收录天数（从 listed_since 计算）
-	Channel       string              `json:"channel"`                 // 业务通道标识
-	ChannelName   string              `json:"channel_name,omitempty"`  // Channel 显示名称
-	Model         string              `json:"model,omitempty"`         // 模型展示名
-	RequestModel  string              `json:"request_model,omitempty"` // 实际请求模型 ID
-	Board         string              `json:"board"`                   // 板块：hot/cold
-	ColdReason    string              `json:"cold_reason,omitempty"`   // 冷板原因（仅 cold 有值）
-	ProbeURL      string              `json:"probe_url,omitempty"`     // 探测端点 URL（脱敏后）
-	TemplateName  string              `json:"template_name,omitempty"` // 请求体模板名称（如有）
-	IntervalMs    int64               `json:"interval_ms"`             // 监测间隔（毫秒）
-	SlowLatencyMs int64               `json:"slow_latency_ms"`         // 慢请求阈值（毫秒）
-	Current       *CurrentStatus      `json:"current_status"`
-	Timeline      []storage.TimePoint `json:"timeline"`
+	Provider          string              `json:"provider"`
+	ProviderName      string              `json:"provider_name,omitempty"` // Provider 显示名称
+	ProviderSlug      string              `json:"provider_slug"`           // URL slug（用于生成专属页面链接）
+	ProviderURL       string              `json:"provider_url"`            // 服务商官网链接
+	Service           string              `json:"service"`
+	ServiceName       string              `json:"service_name,omitempty"`        // Service 显示名称
+	Category          string              `json:"category"`                      // 分类：commercial（商业站）或 public（公益站）
+	Sponsor           string              `json:"sponsor"`                       // 赞助者
+	SponsorURL        string              `json:"sponsor_url"`                   // 赞助者链接
+	SponsorLevel      config.SponsorLevel `json:"sponsor_level,omitempty"`       // 赞助等级（事实字段，不受 enable_annotations 影响）
+	Annotations       []config.Annotation `json:"annotations,omitempty"`         // 统一注解数组（受 enable_annotations 开关控制）
+	PriceMin          *float64            `json:"price_min,omitempty"`           // 参考倍率下限
+	PriceMax          *float64            `json:"price_max,omitempty"`           // 参考倍率
+	ListedDays        *int                `json:"listed_days,omitempty"`         // 收录天数（从 listed_since 计算）
+	Channel           string              `json:"channel"`                       // 业务通道标识
+	ChannelID         string              `json:"channel_id,omitempty"`          // 通道稳定 id（跨产品 join 锚，供 rpdiag sampler 发现）
+	ChannelName       string              `json:"channel_name,omitempty"`        // Channel 显示名称
+	Model             string              `json:"model,omitempty"`               // 模型展示名
+	RequestModel      string              `json:"request_model,omitempty"`       // 实际请求模型 ID
+	ModelVendor       string              `json:"model_vendor,omitempty"`        // 模型厂商受控 code（词表见 internal/modelvendor），与 MonitorLayer 同源同义
+	Board             string              `json:"board"`                         // 板块：hot/cold
+	ColdReason        string              `json:"cold_reason,omitempty"`         // 冷板原因（仅 cold 有值）
+	BoardReason       string              `json:"board_reason,omitempty"`        // 移板机器码（如 "quality_hardfail"），前端本地化
+	BoardReasonModels string              `json:"board_reason_models,omitempty"` // 触发质量移板的模型名（逗号连接）
+	ProbeURL          string              `json:"probe_url,omitempty"`           // 探测端点 URL（脱敏后）
+	TemplateName      string              `json:"template_name,omitempty"`       // 请求体模板名称（如有）
+	IntervalMs        int64               `json:"interval_ms"`                   // 监测间隔（毫秒）
+	SlowLatencyMs     int64               `json:"slow_latency_ms"`               // 慢请求阈值（毫秒）
+	Current           *CurrentStatus      `json:"current_status"`
+	Timeline          []storage.TimePoint `json:"timeline"`
 }
 
 // GetStatus 获取监测状态
@@ -431,12 +534,13 @@ func (h *Handler) GetStatus(c *gin.Context) {
 }
 
 // applyBoardOverrides 将自动移板 override 应用到监测项列表。
-// 覆盖 Board/ColdReason/SponsorLevel 字段，并将父通道 override 传播给同 PSC 的子模型。
-func (h *Handler) applyBoardOverrides(monitors []config.ServiceConfig) []config.ServiceConfig {
+// 覆盖 Board/ColdReason/SponsorLevel 字段，并将父通道 override 传播给同 PSC 的子模型；
+// annotationRules/globalInterval 用于 board 或 sponsor 覆盖后重算 annotations。
+func (h *Handler) applyBoardOverrides(monitors []config.ServiceConfig, annotationRules []config.AnnotationRule, globalInterval time.Duration) []config.ServiceConfig {
 	if h.autoMover == nil {
 		return monitors
 	}
-	return automove.ApplyOverrides(monitors, h.autoMover.Overrides())
+	return automove.ApplyOverrides(monitors, h.autoMover.Overrides(), annotationRules, globalInterval)
 }
 
 // filterMonitors 过滤并去重监测项
@@ -625,6 +729,10 @@ func (h *Handler) buildSitemapXML(providerSlugs []string) string {
 		{"ja", "ja"},  // 日文
 	}
 
+	// 首页与服务商页的可用率数据每个巡检周期都在刷新，lastmod 取当日（UTC）是诚实信号；
+	// 静态内容页（contact）不随天滚动，故不发 lastmod，避免“假新鲜度”被搜索引擎贬权。
+	lastmod := time.Now().UTC().Format("2006-01-02")
+
 	var sb strings.Builder
 	sb.WriteString(`<?xml version="1.0" encoding="UTF-8"?>`)
 	sb.WriteString("\n")
@@ -658,13 +766,16 @@ func (h *Handler) buildSitemapXML(providerSlugs []string) string {
 		// x-default 指向中文首页
 		sb.WriteString(fmt.Sprintf(`    <xhtml:link rel="alternate" hreflang="x-default" href="%s/"/>`+"\n", baseURL))
 
+		sb.WriteString(fmt.Sprintf("    <lastmod>%s</lastmod>\n", lastmod))
 		sb.WriteString("    <priority>1.0</priority>\n")
 		sb.WriteString("    <changefreq>daily</changefreq>\n")
 		sb.WriteString("  </url>\n")
 	}
 
-	// 生成静态页面 URL（contact、contact/apply、contact/change）
-	// 仅索引落地页；apply/change 是表单页，前端已设 noindex
+	// 生成静态内容页 URL（contact 联系页）
+	// 仅索引落地页；apply/change 是表单页，前端已设 noindex。
+	// 不发 lastmod：这些页的正文不随天滚动，避免“假新鲜度”被搜索引擎贬权。
+	// 注：旧 /detect 专题页已下线（301 到 rpdiag 站点），不再收录。
 	staticPages := []struct {
 		path     string
 		priority string
@@ -721,6 +832,7 @@ func (h *Handler) buildSitemapXML(providerSlugs []string) string {
 			// x-default 指向中文版本
 			sb.WriteString(fmt.Sprintf(`    <xhtml:link rel="alternate" hreflang="x-default" href="%s/p/%s"/>`+"\n", baseURL, slug))
 
+			sb.WriteString(fmt.Sprintf("    <lastmod>%s</lastmod>\n", lastmod))
 			sb.WriteString("    <priority>0.8</priority>\n")
 			sb.WriteString("    <changefreq>daily</changefreq>\n")
 			sb.WriteString("  </url>\n")

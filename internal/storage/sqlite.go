@@ -94,6 +94,12 @@ func (s *SQLiteStorage) Init() error {
 	if err := s.ensureErrorDetailColumn(); err != nil {
 		return err
 	}
+	if err := s.ensureProbeHistoryModelIDColumn(); err != nil {
+		return err
+	}
+	if err := s.ensureProbeHistoryModelIDIndex(); err != nil {
+		return err
+	}
 
 	// 在列迁移完成后创建索引
 	//
@@ -142,6 +148,10 @@ func (s *SQLiteStorage) Init() error {
 
 	// 自动移板 override 持久化表
 	if err := s.initOverrideTables(ctx); err != nil {
+		return err
+	}
+	// 质量移板机器字段迁移（幂等 + 一次性 secondary 回填）
+	if err := s.ensureOverrideQualityColumns(); err != nil {
 		return err
 	}
 
@@ -373,6 +383,56 @@ func (s *SQLiteStorage) ensureErrorDetailColumn() error {
 	return nil
 }
 
+// ensureProbeHistoryModelIDColumn 在旧表上添加 model_id 列（向后兼容，可空，无默认值）
+func (s *SQLiteStorage) ensureProbeHistoryModelIDColumn() error {
+	ctx := s.effectiveCtx()
+	rows, err := s.db.QueryContext(ctx, `PRAGMA table_info(probe_history)`)
+	if err != nil {
+		return fmt.Errorf("检查 model_id 列失败: %w", err)
+	}
+	defer rows.Close()
+
+	for rows.Next() {
+		var (
+			cid          int
+			name         string
+			colType      string
+			notNull      int
+			defaultValue sql.NullString
+			pk           int
+		)
+		if err := rows.Scan(&cid, &name, &colType, &notNull, &defaultValue, &pk); err != nil {
+			return fmt.Errorf("扫描表结构失败: %w", err)
+		}
+		if name == "model_id" {
+			return nil // 列已存在，无需添加
+		}
+	}
+
+	if err := rows.Err(); err != nil {
+		return fmt.Errorf("遍历表结构失败: %w", err)
+	}
+
+	if _, err := s.db.ExecContext(ctx, `ALTER TABLE probe_history ADD COLUMN model_id TEXT`); err != nil {
+		return fmt.Errorf("添加 model_id 列失败: %w", err)
+	}
+
+	logger.Info("storage", "已为 probe_history 表添加 model_id 列")
+	return nil
+}
+
+// ensureProbeHistoryModelIDIndex 创建 model_id 的部分索引（幂等）
+func (s *SQLiteStorage) ensureProbeHistoryModelIDIndex() error {
+	ctx := s.effectiveCtx()
+	if _, err := s.db.ExecContext(ctx, `
+		CREATE INDEX IF NOT EXISTS idx_probe_history_mid_ts
+		ON probe_history(model_id, timestamp DESC)
+		WHERE model_id IS NOT NULL`); err != nil {
+		return fmt.Errorf("创建 model_id 索引失败: %w", err)
+	}
+	return nil
+}
+
 // MigrateChannelData 根据配置将 channel 为空的旧数据迁移到指定 channel
 func (s *SQLiteStorage) MigrateChannelData(mappings []ChannelMigrationMapping) error {
 	ctx := s.effectiveCtx()
@@ -434,6 +494,57 @@ func (s *SQLiteStorage) MigrateChannelData(mappings []ChannelMigrationMapping) e
 	return nil
 }
 
+// BackfillProbeHistoryModelIDs 按映射把 model_id IS NULL 的历史行分批回填为对应 model_id（幂等）。
+// 歧义检查（同一 psc4 key 映射到多个不同 model_id）在任何写库操作前完成，发现歧义立即返回错误。
+func (s *SQLiteStorage) BackfillProbeHistoryModelIDs(mappings []ModelIDMigrationMapping) error {
+	const backfillBatch = 5000
+
+	// 步骤一：歧义检查（Go 侧，写库前）
+	// 构建 psc4 -> model_id 的唯一映射，跳过 ModelID 为空的条目。
+	type psc4 struct{ provider, service, channel, model string }
+	seen := make(map[psc4]string, len(mappings))
+	for _, m := range mappings {
+		if m.ModelID == "" {
+			continue
+		}
+		k := psc4{m.Provider, m.Service, m.Channel, m.Model}
+		if existing, ok := seen[k]; ok && existing != m.ModelID {
+			return fmt.Errorf(
+				"model_id 回填歧义：(%s/%s/%s, model=%s) 映射到多个 model_id (%s vs %s)",
+				m.Provider, m.Service, m.Channel, m.Model, existing, m.ModelID,
+			)
+		}
+		seen[k] = m.ModelID
+	}
+
+	// 步骤二：对每个唯一映射执行分批 UPDATE（仅更新 model_id IS NULL 的行）
+	ctx := s.effectiveCtx()
+	var total int64
+	for k, modelID := range seen {
+		for {
+			res, err := s.db.ExecContext(ctx, `
+				UPDATE probe_history SET model_id = ?
+				WHERE id IN (
+					SELECT id FROM probe_history
+					WHERE model_id IS NULL AND provider = ? AND service = ? AND channel = ? AND model = ?
+					LIMIT ?)`,
+				modelID, k.provider, k.service, k.channel, k.model, backfillBatch)
+			if err != nil {
+				return fmt.Errorf("回填 model_id 失败: %w", err)
+			}
+			n, _ := res.RowsAffected()
+			total += n
+			if n == 0 {
+				break
+			}
+		}
+	}
+	if total > 0 {
+		logger.Info("storage", "probe_history model_id 回填完成", "rows", total)
+	}
+	return nil
+}
+
 // Ping 检查数据库连通性
 func (s *SQLiteStorage) Ping() error {
 	return s.db.PingContext(s.effectiveCtx())
@@ -453,8 +564,8 @@ func (s *SQLiteStorage) Close() error {
 func (s *SQLiteStorage) SaveRecord(record *ProbeRecord) error {
 	ctx := s.effectiveCtx()
 	query := `
-		INSERT INTO probe_history (provider, service, channel, model, status, sub_status, http_code, latency, timestamp, error_detail)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+		INSERT INTO probe_history (provider, service, channel, model, status, sub_status, http_code, latency, timestamp, error_detail, model_id)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 	`
 
 	result, err := s.db.ExecContext(ctx, query,
@@ -468,6 +579,7 @@ func (s *SQLiteStorage) SaveRecord(record *ProbeRecord) error {
 		record.Latency,
 		record.Timestamp,
 		record.ErrorDetail,
+		record.ModelID,
 	)
 
 	if err != nil {
@@ -626,6 +738,183 @@ ORDER BY p.provider, p.service, p.channel, p.model, p.timestamp DESC
 	return result, nil
 }
 
+// dedupModelIDKeys 把入参 ProbeHistoryKey 列表按 model_id 去重，
+// 返回 model_id→入参 key 的反查表（first-wins）与去重后的 model_id 顺序列表。
+//
+// 返回 map 用于把 DB 行（其展示名列在改名后已是新名）映射回 caller 的 key——
+// 必须按 model_id 反查，绝不能用 DB 行的 provider/service/channel/model 重建 key。
+func dedupModelIDKeys(keys []ProbeHistoryKey) (map[string]ProbeHistoryKey, []string) {
+	keyByModelID := make(map[string]ProbeHistoryKey, len(keys))
+	modelIDs := make([]string, 0, len(keys))
+	for _, k := range keys {
+		if _, dup := keyByModelID[k.ModelID]; dup {
+			continue
+		}
+		keyByModelID[k.ModelID] = k
+		modelIDs = append(modelIDs, k.ModelID)
+	}
+	return keyByModelID, modelIDs
+}
+
+// GetLatestBatchByModelID 按 model_id 批量获取每个监测项的最新记录（跨展示名历史连续）。
+//
+// 实现说明：
+// - CTE(keys) 仅承载 model_id 列，JOIN probe_history 命中部分索引 idx_probe_history_mid_ts
+// - 窗口函数 ROW_NUMBER() 按 model_id 分组取最新一条（rn=1）
+// - 结果 map 以入参 ProbeHistoryKey 为键，按 SELECT 出的 model_id 反查
+func (s *SQLiteStorage) GetLatestBatchByModelID(keys []ProbeHistoryKey) (map[ProbeHistoryKey]*ProbeRecord, error) {
+	ctx := s.effectiveCtx()
+	result := make(map[ProbeHistoryKey]*ProbeRecord, len(keys))
+	if len(keys) == 0 {
+		return result, nil
+	}
+
+	keyByModelID, modelIDs := dedupModelIDKeys(keys)
+
+	var b strings.Builder
+	args := make([]any, 0, len(modelIDs))
+
+	b.WriteString("WITH keys(model_id) AS (VALUES ")
+	for i, modelID := range modelIDs {
+		if i > 0 {
+			b.WriteString(",")
+		}
+		b.WriteString("(?)")
+		args = append(args, modelID)
+	}
+	b.WriteString(`),
+ranked AS (
+	SELECT
+		p.model_id, p.id, p.provider, p.service, p.channel, p.model, p.status, p.sub_status, p.http_code, p.latency, p.timestamp,
+		ROW_NUMBER() OVER (PARTITION BY p.model_id ORDER BY p.timestamp DESC, p.id DESC) AS rn
+	FROM probe_history p
+	JOIN keys k ON p.model_id = k.model_id
+)
+SELECT model_id, id, provider, service, channel, model, status, sub_status, http_code, latency, timestamp
+FROM ranked
+WHERE rn = 1
+`)
+
+	rows, err := s.db.QueryContext(ctx, b.String(), args...)
+	if err != nil {
+		return nil, fmt.Errorf("按 model_id 批量查询最新记录失败: %w", err)
+	}
+	defer rows.Close()
+
+	for rows.Next() {
+		rec := &ProbeRecord{}
+		var modelID string
+		var subStatusStr string
+		if err := rows.Scan(
+			&modelID,
+			&rec.ID,
+			&rec.Provider,
+			&rec.Service,
+			&rec.Channel,
+			&rec.Model,
+			&rec.Status,
+			&subStatusStr,
+			&rec.HttpCode,
+			&rec.Latency,
+			&rec.Timestamp,
+		); err != nil {
+			return nil, fmt.Errorf("扫描 model_id 最新记录失败: %w", err)
+		}
+		rec.SubStatus = SubStatus(subStatusStr)
+		rec.ModelID = modelID
+		if key, ok := keyByModelID[modelID]; ok {
+			result[key] = rec
+		}
+	}
+
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("迭代 model_id 最新记录失败: %w", err)
+	}
+
+	return result, nil
+}
+
+// GetHistoryBatchByModelID 按 model_id 批量获取多个监测项的历史记录（时间范围，跨展示名历史连续）。
+//
+// 实现说明：
+// - CTE(keys) 仅承载 model_id，JOIN 命中部分索引；ORDER BY model_id, timestamp DESC 便于分桶
+// - 返回前对每个 key 的切片 reverse，保证时间升序（与 GetHistoryBatch 一致）
+// - 结果 map 以入参 ProbeHistoryKey 为键，按 SELECT 出的 model_id 反查
+func (s *SQLiteStorage) GetHistoryBatchByModelID(keys []ProbeHistoryKey, since time.Time) (map[ProbeHistoryKey][]*ProbeRecord, error) {
+	ctx := s.effectiveCtx()
+	result := make(map[ProbeHistoryKey][]*ProbeRecord, len(keys))
+	if len(keys) == 0 {
+		return result, nil
+	}
+
+	keyByModelID, modelIDs := dedupModelIDKeys(keys)
+
+	var b strings.Builder
+	args := make([]any, 0, len(modelIDs)+1)
+
+	b.WriteString("WITH keys(model_id) AS (VALUES ")
+	for i, modelID := range modelIDs {
+		if i > 0 {
+			b.WriteString(",")
+		}
+		b.WriteString("(?)")
+		args = append(args, modelID)
+	}
+	b.WriteString(")\n")
+	b.WriteString(`
+SELECT
+	p.model_id, p.id, p.provider, p.service, p.channel, p.model, p.status, p.sub_status, p.http_code, p.latency, p.timestamp
+FROM probe_history p
+JOIN keys k ON p.model_id = k.model_id
+WHERE p.timestamp >= ?
+ORDER BY p.model_id, p.timestamp DESC
+`)
+	args = append(args, since.Unix())
+
+	rows, err := s.db.QueryContext(ctx, b.String(), args...)
+	if err != nil {
+		return nil, fmt.Errorf("按 model_id 批量查询历史记录失败: %w", err)
+	}
+	defer rows.Close()
+
+	for rows.Next() {
+		rec := &ProbeRecord{}
+		var modelID string
+		var subStatusStr string
+		if err := rows.Scan(
+			&modelID,
+			&rec.ID,
+			&rec.Provider,
+			&rec.Service,
+			&rec.Channel,
+			&rec.Model,
+			&rec.Status,
+			&subStatusStr,
+			&rec.HttpCode,
+			&rec.Latency,
+			&rec.Timestamp,
+		); err != nil {
+			return nil, fmt.Errorf("扫描 model_id 历史记录失败: %w", err)
+		}
+		rec.SubStatus = SubStatus(subStatusStr)
+		rec.ModelID = modelID
+		if key, ok := keyByModelID[modelID]; ok {
+			result[key] = append(result[key], rec)
+		}
+	}
+
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("迭代 model_id 历史记录失败: %w", err)
+	}
+
+	// DESC 取数利用索引，返回前对每个 key 翻转为时间升序
+	for k := range result {
+		reverseRecords(result[k])
+	}
+
+	return result, nil
+}
+
 // GetLatest 获取最新记录
 func (s *SQLiteStorage) GetLatest(provider, service, channel, model string) (*ProbeRecord, error) {
 	ctx := s.effectiveCtx()
@@ -712,6 +1001,144 @@ func (s *SQLiteStorage) GetHistory(provider, service, channel, model string, sin
 
 	// DESC 取数利用索引，返回前翻转为时间升序
 	reverseRecords(records)
+
+	return records, nil
+}
+
+// GetLatestByModelID 按 model_id 获取最新一条记录（跨展示名历史连续）。
+func (s *SQLiteStorage) GetLatestByModelID(modelID string) (*ProbeRecord, error) {
+	ctx := s.effectiveCtx()
+	query := `
+		SELECT id, provider, service, channel, model, status, sub_status, http_code, latency, timestamp
+		FROM probe_history
+		WHERE model_id = ?
+		ORDER BY timestamp DESC, id DESC
+		LIMIT 1
+	`
+
+	var record ProbeRecord
+	var subStatusStr string
+	err := s.db.QueryRowContext(ctx, query, modelID).Scan(
+		&record.ID,
+		&record.Provider,
+		&record.Service,
+		&record.Channel,
+		&record.Model,
+		&record.Status,
+		&subStatusStr,
+		&record.HttpCode,
+		&record.Latency,
+		&record.Timestamp,
+	)
+
+	if err == sql.ErrNoRows {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, fmt.Errorf("按 model_id 查询最新记录失败: %w", err)
+	}
+
+	record.SubStatus = SubStatus(subStatusStr)
+	record.ModelID = modelID
+	return &record, nil
+}
+
+// GetHistoryByModelID 按 model_id 获取 since 之后的历史记录（时间升序，跨展示名历史连续）。
+func (s *SQLiteStorage) GetHistoryByModelID(modelID string, since time.Time) ([]*ProbeRecord, error) {
+	ctx := s.effectiveCtx()
+	query := `
+		SELECT id, provider, service, channel, model, status, sub_status, http_code, latency, timestamp
+		FROM probe_history
+		WHERE model_id = ? AND timestamp >= ?
+		ORDER BY timestamp DESC
+	`
+
+	rows, err := s.db.QueryContext(ctx, query, modelID, since.Unix())
+	if err != nil {
+		return nil, fmt.Errorf("按 model_id 查询历史记录失败: %w", err)
+	}
+	defer rows.Close()
+
+	var records []*ProbeRecord
+	for rows.Next() {
+		var record ProbeRecord
+		var subStatusStr string
+		if err := rows.Scan(
+			&record.ID,
+			&record.Provider,
+			&record.Service,
+			&record.Channel,
+			&record.Model,
+			&record.Status,
+			&subStatusStr,
+			&record.HttpCode,
+			&record.Latency,
+			&record.Timestamp,
+		); err != nil {
+			return nil, fmt.Errorf("扫描 model_id 历史记录失败: %w", err)
+		}
+		record.SubStatus = SubStatus(subStatusStr)
+		record.ModelID = modelID
+		records = append(records, &record)
+	}
+
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("迭代 model_id 历史记录失败: %w", err)
+	}
+
+	reverseRecords(records)
+	return records, nil
+}
+
+// GetHistoryWithLimitByModelID 按 model_id 获取 since 之后最近 limit 条记录（timestamp DESC + id DESC）。
+// 返回值保留时间倒序（最新在前）；包含 ErrorDetail 字段。
+func (s *SQLiteStorage) GetHistoryWithLimitByModelID(modelID string, since time.Time, limit int) ([]*ProbeRecord, error) {
+	ctx := s.effectiveCtx()
+	if limit <= 0 {
+		limit = 200
+	}
+
+	query := `
+		SELECT id, provider, service, channel, model, status, sub_status, http_code, latency, timestamp, error_detail
+		FROM probe_history
+		WHERE model_id = ? AND timestamp >= ?
+		ORDER BY timestamp DESC, id DESC
+		LIMIT ?
+	`
+
+	rows, err := s.db.QueryContext(ctx, query, modelID, since.Unix(), limit)
+	if err != nil {
+		return nil, fmt.Errorf("按 model_id 查询限量历史记录失败: %w", err)
+	}
+	defer rows.Close()
+
+	records := make([]*ProbeRecord, 0, limit)
+	for rows.Next() {
+		var record ProbeRecord
+		var subStatusStr string
+		if err := rows.Scan(
+			&record.ID,
+			&record.Provider,
+			&record.Service,
+			&record.Channel,
+			&record.Model,
+			&record.Status,
+			&subStatusStr,
+			&record.HttpCode,
+			&record.Latency,
+			&record.Timestamp,
+			&record.ErrorDetail,
+		); err != nil {
+			return nil, fmt.Errorf("扫描 model_id 限量历史记录失败: %w", err)
+		}
+		record.SubStatus = SubStatus(subStatusStr)
+		record.ModelID = modelID
+		records = append(records, &record)
+	}
+
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("迭代 model_id 限量历史记录失败: %w", err)
+	}
 
 	return records, nil
 }
@@ -1425,11 +1852,73 @@ func (s *SQLiteStorage) initOverrideTables(ctx context.Context) error {
 	return nil
 }
 
+// ensureOverrideQualityColumns 在既有 monitor_overrides 表上补齐质量移板列
+// （幂等，参照 ensureSubStatusColumn）。当 availability_latched 列本次新增时，
+// 一次性把既有 secondary 行回填为可用率闩锁：本功能上线前，任何 secondary
+// 都必然是可用率驱动降板；不回填的话 Restore 会误判为「从未降板」并在临界可用率
+// 时错误地把它升回主板。回填以「本次是否新增该列」为守卫，绝不无条件每次 Init
+// 都跑（否则将来质量驱动的 secondary 会被误标成可用率闩锁）。
+func (s *SQLiteStorage) ensureOverrideQualityColumns() error {
+	ctx := s.effectiveCtx()
+	rows, err := s.db.QueryContext(ctx, `PRAGMA table_info(monitor_overrides)`)
+	if err != nil {
+		return fmt.Errorf("查询 monitor_overrides 表结构失败: %w", err)
+	}
+	existing := map[string]bool{}
+	for rows.Next() {
+		var (
+			cid     int
+			name    string
+			colType string
+			notNull int
+			dflt    sql.NullString
+			pk      int
+		)
+		if err := rows.Scan(&cid, &name, &colType, &notNull, &dflt, &pk); err != nil {
+			rows.Close()
+			return fmt.Errorf("扫描 monitor_overrides 表结构失败: %w", err)
+		}
+		existing[name] = true
+	}
+	rows.Close()
+	if err := rows.Err(); err != nil {
+		return fmt.Errorf("遍历 monitor_overrides 表结构失败: %w", err)
+	}
+
+	addCols := []struct{ name, ddl string }{
+		{"board_reason", `ALTER TABLE monitor_overrides ADD COLUMN board_reason TEXT NOT NULL DEFAULT ''`},
+		{"quality_latched", `ALTER TABLE monitor_overrides ADD COLUMN quality_latched INTEGER NOT NULL DEFAULT 0`},
+		{"quality_recovery_count", `ALTER TABLE monitor_overrides ADD COLUMN quality_recovery_count INTEGER NOT NULL DEFAULT 0`},
+		{"quality_trigger_models", `ALTER TABLE monitor_overrides ADD COLUMN quality_trigger_models TEXT NOT NULL DEFAULT ''`},
+		{"quality_last_generation", `ALTER TABLE monitor_overrides ADD COLUMN quality_last_generation INTEGER NOT NULL DEFAULT 0`},
+		{"availability_latched", `ALTER TABLE monitor_overrides ADD COLUMN availability_latched INTEGER NOT NULL DEFAULT 0`},
+	}
+	availabilityLatchedExisted := existing["availability_latched"]
+	for _, c := range addCols {
+		if existing[c.name] {
+			continue
+		}
+		if _, err := s.db.ExecContext(ctx, c.ddl); err != nil {
+			return fmt.Errorf("添加 monitor_overrides 列 %s 失败: %w", c.name, err)
+		}
+	}
+	if !availabilityLatchedExisted {
+		if _, err := s.db.ExecContext(ctx, `UPDATE monitor_overrides SET availability_latched = 1 WHERE board = 'secondary'`); err != nil {
+			return fmt.Errorf("回填 availability_latched 失败: %w", err)
+		}
+		logger.Info("storage", "已为 monitor_overrides 表补齐质量移板列并回填 secondary 可用率闩锁")
+	}
+	return nil
+}
+
 // ListMonitorOverrides 加载全部 override 快照。
 func (s *SQLiteStorage) ListMonitorOverrides() ([]MonitorOverrideRecord, error) {
 	ctx := s.effectiveCtx()
 	rows, err := s.db.QueryContext(ctx, `
-		SELECT provider, service, channel, model, board, cold_reason, sponsor_level, created_at, updated_at
+		SELECT provider, service, channel, model, board, cold_reason, sponsor_level,
+		       board_reason, quality_latched, quality_recovery_count,
+		       quality_trigger_models, quality_last_generation, availability_latched,
+		       created_at, updated_at
 		FROM monitor_overrides
 		ORDER BY provider, service, channel, model
 	`)
@@ -1441,13 +1930,21 @@ func (s *SQLiteStorage) ListMonitorOverrides() ([]MonitorOverrideRecord, error) 
 	var records []MonitorOverrideRecord
 	for rows.Next() {
 		var r MonitorOverrideRecord
+		// SQLite 无 bool 类型：闩锁列以 INTEGER 0/1 存，代次以 int64 存
+		var qLatched, availLatched int
+		var qGen int64
 		if err := rows.Scan(
 			&r.Key.Provider, &r.Key.Service, &r.Key.Channel, &r.Key.Model,
 			&r.Board, &r.ColdReason, &r.SponsorLevel,
+			&r.BoardReason, &qLatched, &r.QualityRecoveryCount,
+			&r.QualityTriggerModels, &qGen, &availLatched,
 			&r.CreatedAt, &r.UpdatedAt,
 		); err != nil {
 			return nil, fmt.Errorf("扫描 monitor_overrides 失败: %w", err)
 		}
+		r.QualityLatched = qLatched != 0
+		r.AvailabilityLatched = availLatched != 0
+		r.QualityLastGeneration = uint64(qGen)
 		records = append(records, r)
 	}
 	return records, rows.Err()
@@ -1490,8 +1987,11 @@ func (s *SQLiteStorage) ReplaceMonitorOverrides(records []MonitorOverrideRecord)
 	if len(records) > 0 {
 		stmt, err := tx.PrepareContext(ctx, `
 			INSERT INTO monitor_overrides (
-				provider, service, channel, model, board, cold_reason, sponsor_level, created_at, updated_at
-			) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+				provider, service, channel, model, board, cold_reason, sponsor_level,
+				board_reason, quality_latched, quality_recovery_count,
+				quality_trigger_models, quality_last_generation, availability_latched,
+				created_at, updated_at
+			) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 		`)
 		if err != nil {
 			return fmt.Errorf("预编译 monitor_overrides 插入语句失败: %w", err)
@@ -1512,7 +2012,10 @@ func (s *SQLiteStorage) ReplaceMonitorOverrides(records []MonitorOverrideRecord)
 
 			if _, err := stmt.ExecContext(ctx,
 				r.Key.Provider, r.Key.Service, r.Key.Channel, r.Key.Model,
-				r.Board, r.ColdReason, r.SponsorLevel, createdAt, updatedAt,
+				r.Board, r.ColdReason, r.SponsorLevel,
+				r.BoardReason, b2i(r.QualityLatched), r.QualityRecoveryCount,
+				r.QualityTriggerModels, int64(r.QualityLastGeneration), b2i(r.AvailabilityLatched),
+				createdAt, updatedAt,
 			); err != nil {
 				return fmt.Errorf("写入 monitor_overrides 失败: %w", err)
 			}
